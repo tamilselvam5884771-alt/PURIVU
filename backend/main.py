@@ -50,6 +50,25 @@ app.add_middleware(
 )
 
 # -----------------------------
+# Root Welcome Endpoint
+# -----------------------------
+@app.get(
+    "/",
+    summary="Root API Welcome",
+    tags=["System"]
+)
+async def root():
+    """
+    Root endpoint returning service identity and helpful quick links.
+    """
+    return {
+        "service": "PURIVU API - BIS Saathi Assistant",
+        "status": "online",
+        "health": "/api/health",
+        "docs": "/docs"
+    }
+
+# -----------------------------
 # Health Check Endpoint
 # -----------------------------
 @app.get(
