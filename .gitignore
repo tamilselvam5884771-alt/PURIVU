@@ -1,0 +1,22 @@
+# Environment & Secrets
+.env
+.env*.local
+*.secret
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+*.log
+
+# Node & Frontend Build
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.DS_Store
+scratch/

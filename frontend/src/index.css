@@ -1,0 +1,125 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Manrope:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+:root {
+  --purivu-bg: #FFF9F5;
+  --purivu-bg-warm: #FBE3D5;
+  --purivu-plum: #4B1248;
+  --purivu-plum-hover: #64175F;
+  --purivu-terracotta: #D98268;
+  --purivu-peach: #F3C7B5;
+  --purivu-blue: #2864E8;
+  --purivu-violet: #6545D8;
+  --purivu-text: #29242A;
+  --purivu-text-muted: #756873;
+  --purivu-card: #FFFFFF;
+  --purivu-border: #EEDFD7;
+
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  color-scheme: light;
+  background-color: var(--purivu-bg);
+  color: var(--purivu-text);
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at 50% -10%, #FBE3D5 0%, #FFF9F5 65%);
+  overflow-x: hidden;
+}
+
+/* Typography */
+h1, h2, h3, .font-heading {
+  font-family: 'Manrope', sans-serif;
+  color: var(--purivu-plum);
+}
+
+/* Redesigned Light Theme Knowledge Pulse Animation */
+@keyframes lightKnowledgePulse {
+  0% {
+    transform: scale(0.96);
+    opacity: 0.3;
+    box-shadow: 0 0 0 0 rgba(101, 69, 216, 0.2);
+  }
+  50% {
+    transform: scale(1.06);
+    opacity: 0.6;
+    box-shadow: 0 0 30px 10px rgba(101, 69, 216, 0.12);
+  }
+  100% {
+    transform: scale(0.96);
+    opacity: 0.3;
+    box-shadow: 0 0 0 0 rgba(101, 69, 216, 0.2);
+  }
+}
+
+@keyframes lightRingExpand {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+}
+
+.animate-knowledge-pulse {
+  animation: lightKnowledgePulse 5s ease-in-out infinite;
+}
+
+.animate-ring-1 {
+  animation: lightRingExpand 4s cubic-bezier(0.1, 0.7, 0.1, 1) infinite;
+}
+
+.animate-ring-2 {
+  animation: lightRingExpand 4s cubic-bezier(0.1, 0.7, 0.1, 1) infinite 2s;
+}
+
+/* Warm Card Surfaces & Inputs */
+.purivu-card {
+  background: #FFFFFF;
+  border: 1px solid var(--purivu-border);
+  box-shadow: 0 10px 30px -15px rgba(75, 18, 72, 0.05);
+  border-radius: 20px;
+}
+
+.purivu-card-hover {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.purivu-card-hover:hover {
+  background: #FFFFFF;
+  border-color: rgba(217, 130, 104, 0.5);
+  box-shadow: 0 12px 35px -10px rgba(75, 18, 72, 0.09);
+  transform: translateY(-2px);
+}
+
+.purivu-input {
+  background: #FFFFFF;
+  border: 1px solid var(--purivu-border);
+  border-radius: 16px;
+  box-shadow: 0 4px 20px -5px rgba(75, 18, 72, 0.04);
+  transition: all 0.25s ease;
+}
+
+.purivu-input:focus-within {
+  border-color: var(--purivu-plum);
+  box-shadow: 0 0 0 3px rgba(75, 18, 72, 0.08);
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #FFF9F5;
+}
+::-webkit-scrollbar-thumb {
+  background: #EEDFD7;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #D98268;
+}

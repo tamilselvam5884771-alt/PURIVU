@@ -1,0 +1,15 @@
+streamlit
+google-generativeai
+langchain
+langchain-community
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+pypdf
+python-dotenv
+fastapi
+uvicorn
+pydantic
+python-multipart
+pillow
+streamlit
