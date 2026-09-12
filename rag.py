@@ -12,8 +12,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-BIS_DATA_DIR = os.path.join("data", "bis")
-OUTPUT_INDEX_DIR = "faiss_index_bis"
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+BIS_DATA_DIR = BASE_DIR / "data" / "bis"
+OUTPUT_INDEX_DIR = BASE_DIR / "faiss_index_bis"
 
 def determine_category(filename, text):
     fn = filename.lower()

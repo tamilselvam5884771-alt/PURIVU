@@ -64,13 +64,14 @@ async def get_health():
     Verifies that the PURIVU service is online and the BIS FAISS vector index is ready.
     """
     if not rag_service.is_ready():
+        err_detail = rag_service._init_error or "FAISS vector database index is missing or failed to initialize."
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
                 "status": "error",
                 "service": "PURIVU",
                 "rag": "not_ready",
-                "error": "FAISS vector database index is missing or failed to initialize."
+                "error": err_detail
             }
         )
     

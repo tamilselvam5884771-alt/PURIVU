@@ -14,11 +14,22 @@ import google.generativeai as genai
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
+from pathlib import Path
+
 # Load environment variables
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-INDEX_DIR = "faiss_index_bis" if os.path.exists("faiss_index_bis") else "faiss_index"
+# Deployment-safe project base directory
+BASE_DIR = Path(__file__).resolve().parent.parent
+FAISS_BIS_DIR = BASE_DIR / "faiss_index_bis"
+FAISS_DEF_DIR = BASE_DIR / "faiss_index"
+
+if (FAISS_BIS_DIR / "index.faiss").exists() and (FAISS_BIS_DIR / "index.pkl").exists():
+    INDEX_DIR = FAISS_BIS_DIR
+elif (FAISS_DEF_DIR / "index.faiss").exists() and (FAISS_DEF_DIR / "index.pkl").exists():
+    INDEX_DIR = FAISS_DEF_DIR
+else:
+    INDEX_DIR = FAISS_BIS_DIR
 
 # Model priority list for fallback handling
 MODEL_NAMES = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
@@ -33,14 +44,19 @@ class RAGService:
     def initialize(self):
         if self.initialized:
             return
-        if not GEMINI_API_KEY:
-            self._init_error = "GEMINI_API_KEY is missing from environment."
+        
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            self._init_error = "GEMINI_API_KEY is missing from environment. Set GEMINI_API_KEY in Railway Variables."
             raise ValueError(self._init_error)
 
-        genai.configure(api_key=GEMINI_API_KEY)
+        genai.configure(api_key=api_key)
 
-        if not os.path.exists(INDEX_DIR):
-            self._init_error = f"FAISS index directory '{INDEX_DIR}' does not exist. Run rag.py to build it."
+        index_faiss = INDEX_DIR / "index.faiss"
+        index_pkl = INDEX_DIR / "index.pkl"
+
+        if not index_faiss.exists() or not index_pkl.exists():
+            self._init_error = f"FAISS index files ('index.faiss', 'index.pkl') not found in '{INDEX_DIR}'."
             raise FileNotFoundError(self._init_error)
 
         try:
@@ -48,20 +64,22 @@ class RAGService:
                 model_name="sentence-transformers/all-MiniLM-L6-v2"
             )
             self.db = FAISS.load_local(
-                INDEX_DIR,
+                str(INDEX_DIR),
                 self.embeddings,
                 allow_dangerous_deserialization=True
             )
             self.initialized = True
         except Exception as e:
-            self._init_error = f"Failed to load FAISS index: {str(e)}"
+            self._init_error = f"Failed to load FAISS index from {INDEX_DIR}: {str(e)}"
             raise RuntimeError(self._init_error) from e
 
     def is_ready(self) -> bool:
         if not self.initialized:
             try:
                 self.initialize()
-            except Exception:
+            except Exception as e:
+                if not self._init_error:
+                    self._init_error = str(e)
                 return False
         return self.initialized and self.db is not None
 
