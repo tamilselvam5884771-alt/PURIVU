@@ -24,6 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 FAISS_BIS_DIR = BASE_DIR / "faiss_index_bis"
 FAISS_DEF_DIR = BASE_DIR / "faiss_index"
 
+# Prioritize BIS FAISS vector index specifically
 if (FAISS_BIS_DIR / "index.faiss").exists() and (FAISS_BIS_DIR / "index.pkl").exists():
     INDEX_DIR = FAISS_BIS_DIR
 elif (FAISS_DEF_DIR / "index.faiss").exists() and (FAISS_DEF_DIR / "index.pkl").exists():
@@ -31,8 +32,8 @@ elif (FAISS_DEF_DIR / "index.faiss").exists() and (FAISS_DEF_DIR / "index.pkl").
 else:
     INDEX_DIR = FAISS_BIS_DIR
 
-# Model priority list for fallback handling
-MODEL_NAMES = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
+# Model priority list for fallback handling (Valid Gemini API models)
+MODEL_NAMES = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "gemini-flash-latest", "gemini-pro-latest"]
 
 class RAGService:
     def __init__(self):
@@ -48,6 +49,7 @@ class RAGService:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             self._init_error = "GEMINI_API_KEY is missing from environment. Set GEMINI_API_KEY in Railway Variables."
+            print(f"[RAG_INIT_ERROR] {self._init_error}")
             raise ValueError(self._init_error)
 
         genai.configure(api_key=api_key)
@@ -55,8 +57,14 @@ class RAGService:
         index_faiss = INDEX_DIR / "index.faiss"
         index_pkl = INDEX_DIR / "index.pkl"
 
+        print(f"[RAG_DIAG] Resolved BASE_DIR: {BASE_DIR}")
+        print(f"[RAG_DIAG] Resolved INDEX_DIR: {INDEX_DIR}")
+        print(f"[RAG_DIAG] index.faiss exists: {index_faiss.exists()}")
+        print(f"[RAG_DIAG] index.pkl exists: {index_pkl.exists()}")
+
         if not index_faiss.exists() or not index_pkl.exists():
             self._init_error = f"FAISS index files ('index.faiss', 'index.pkl') not found in '{INDEX_DIR}'."
+            print(f"[RAG_INIT_ERROR] {self._init_error}")
             raise FileNotFoundError(self._init_error)
 
         try:
@@ -69,8 +77,13 @@ class RAGService:
                 allow_dangerous_deserialization=True
             )
             self.initialized = True
+            chunks = self.get_chunk_count()
+            print(f"[RAG_DIAG] FAISS vector index loaded successfully. Total chunks (ntotal): {chunks}")
+            if chunks == 0:
+                print(f"[RAG_WARN] FAISS index loaded but ntotal is 0!")
         except Exception as e:
             self._init_error = f"Failed to load FAISS index from {INDEX_DIR}: {str(e)}"
+            print(f"[RAG_INIT_ERROR] {self._init_error}")
             raise RuntimeError(self._init_error) from e
 
     def is_ready(self) -> bool:
