@@ -35,6 +35,8 @@ app = FastAPI(
 # CORS Configuration
 # -----------------------------
 ALLOWED_ORIGINS = [
+    "https://purivu-production-28e6.up.railway.app",
+    "https://purivu-production.up.railway.app",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:3000",
@@ -44,6 +46,7 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.up\.railway\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
