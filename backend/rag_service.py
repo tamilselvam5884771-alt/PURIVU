@@ -34,7 +34,7 @@ else:
     INDEX_DIR = FAISS_BIS_DIR
 
 # Model priority list for fallback handling (Valid & active Gemini API models)
-MODEL_NAMES = ["gemini-3.6-flash", "gemini-flash-latest", "gemini-pro-latest"]
+MODEL_NAMES = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
 
 class SimpleLRUCache:
     """Thread-safe lightweight in-memory LRU cache."""
