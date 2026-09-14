@@ -32,8 +32,8 @@ elif (FAISS_DEF_DIR / "index.faiss").exists() and (FAISS_DEF_DIR / "index.pkl").
 else:
     INDEX_DIR = FAISS_BIS_DIR
 
-# Model priority list for fallback handling (Valid Gemini API models)
-MODEL_NAMES = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "gemini-flash-latest", "gemini-pro-latest"]
+# Model priority list for fallback handling (Valid & active Gemini API models)
+MODEL_NAMES = ["gemini-3.6-flash", "gemini-flash-latest", "gemini-pro-latest"]
 
 class RAGService:
     def __init__(self):
@@ -41,11 +41,13 @@ class RAGService:
         self.embeddings = None
         self.initialized = False
         self._init_error = None
+        self.init_time_sec = 0.0
 
     def initialize(self):
         if self.initialized:
             return
         
+        t_start = time.time()
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             self._init_error = "GEMINI_API_KEY is missing from environment. Set GEMINI_API_KEY in Railway Variables."
@@ -68,17 +70,28 @@ class RAGService:
             raise FileNotFoundError(self._init_error)
 
         try:
+            t_emb_start = time.time()
             self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
             )
+            t_emb_end = time.time()
+            print(f"[RAG_DIAG] Embedding model (sentence-transformers/all-MiniLM-L6-v2) loaded in {t_emb_end - t_emb_start:.2f}s")
+
+            t_faiss_start = time.time()
             self.db = FAISS.load_local(
                 str(INDEX_DIR),
                 self.embeddings,
                 allow_dangerous_deserialization=True
             )
+            t_faiss_end = time.time()
+            print(f"[RAG_DIAG] FAISS vector index loaded in {t_faiss_end - t_faiss_start:.2f}s")
+
             self.initialized = True
+            self.init_time_sec = round(time.time() - t_start, 4)
             chunks = self.get_chunk_count()
-            print(f"[RAG_DIAG] FAISS vector index loaded successfully. Total chunks (ntotal): {chunks}")
+            print(f"[RAG_DIAG] PURIVU RAG Service fully initialized in {self.init_time_sec}s. Total chunks: {chunks}")
             if chunks == 0:
                 print(f"[RAG_WARN] FAISS index loaded but ntotal is 0!")
         except Exception as e:
@@ -121,7 +134,14 @@ class RAGService:
         for pattern, additions in expansion_patterns:
             if re.search(pattern, q_lower):
                 expanded_terms.extend(additions)
-        return expanded_terms
+        # Deduplicate terms while maintaining order
+        seen = set()
+        deduped = []
+        for term in expanded_terms:
+            if term not in seen:
+                seen.add(term)
+                deduped.append(term)
+        return deduped
 
     def retrieve_hybrid_documents(self, query: str, top_k: int = 6):
         if not self.is_ready():
@@ -130,9 +150,9 @@ class RAGService:
         # Search base query
         results = self.db.similarity_search_with_score(query, k=top_k)
 
-        # Expand query and search additional terms
+        # Expand query and search additional terms if applicable
         extra_phrases = self.expand_query(query)
-        for phrase in extra_phrases:
+        for phrase in extra_phrases[:2]:  # Limit extra expansion queries to top 2 to avoid redundant calls
             extra_results = self.db.similarity_search_with_score(phrase, k=3)
             results.extend(extra_results)
 
@@ -150,13 +170,20 @@ class RAGService:
         last_error = None
         for model_name in MODEL_NAMES:
             try:
+                t0 = time.time()
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(prompt)
                 if response and response.text:
+                    dt = time.time() - t0
+                    print(f"[RAG_DIAG] Gemini API call succeeded using '{model_name}' in {dt:.2f}s")
                     return response.text
             except Exception as e:
+                err_str = str(e)
+                print(f"[RAG_WARN] Gemini API call failed for '{model_name}': {err_str[:120]}")
                 last_error = e
-                time.sleep(1)
+                # If model not found or invalid, skip sleeping and try next model immediately
+                if "404" not in err_str and "NOT_FOUND" not in err_str:
+                    time.sleep(0.5)
                 continue
         raise RuntimeError(f"Gemini API request failed across models: {str(last_error)}")
 
@@ -208,15 +235,25 @@ class RAGService:
         return query
 
     def process_query(self, question: str, response_language: str = None) -> Dict[str, Any]:
+        t_req_start = time.time()
+
+        # Step 1: Initialization check timing
+        t_init_check_start = time.time()
+        was_initialized = self.initialized
         if not self.is_ready():
             raise RuntimeError(self._init_error or "RAG service is not ready.")
+        t_init_check = time.time() - t_init_check_start
 
-        # Determine target response language
+        # Step 2: Response language determination & query normalization
+        t_norm_start = time.time()
         target_lang = self.normalize_response_language(response_language, question)
-
-        # Normalize query for vector lookup if non-English
         retrieval_query = self.normalize_query_for_retrieval(question)
+        t_norm = time.time() - t_norm_start
+
+        # Step 3: Retrieval & Query Expansion timing
+        t_retrieval_start = time.time()
         hybrid_docs = self.retrieve_hybrid_documents(retrieval_query, top_k=6)
+        t_retrieval = time.time() - t_retrieval_start
 
         if not hybrid_docs:
             refusal = "Sorry, I couldn't find that information in the provided BIS documents."
@@ -224,13 +261,25 @@ class RAGService:
                 refusal = "மன்னித்துக்கொள்ளுங்கள், வழங்கப்பட்ட BIS ஆவணங்களில் இந்தத் தகவல் கிடைக்கவில்லை. தவறான BIS தரநிலை அல்லது certification requirement-ஐ உருவாக்காமல் இருக்க, நான் இதை உறுதிப்படுத்தப்பட்ட தகவலாகக் கூறவில்லை."
             elif target_lang == "Hindi":
                 refusal = "क्षमा करें, दिए गए BIS दस्तावेजों में यह जानकारी नहीं मिल सकी। किसी गलत जानकारी से बचने के लिए, केवल आधिकारिक दस्तावेजों के आधार पर ही उत्तर दिया जाता है।"
+            t_total = time.time() - t_req_start
+            print(f"[RAG_TIMING] Question: '{question[:40]}...' | No docs found | Total: {t_total:.3f}s")
             return {
                 "answer": refusal,
                 "evidence_status": "Limited Evidence",
                 "sources": [],
-                "response_language": target_lang
+                "response_language": target_lang,
+                "execution_time_seconds": round(t_total, 3),
+                "timings": {
+                    "init_check_sec": round(t_init_check, 4),
+                    "query_norm_sec": round(t_norm, 4),
+                    "retrieval_sec": round(t_retrieval, 4),
+                    "gemini_sec": 0.0,
+                    "total_sec": round(t_total, 4)
+                }
             }
 
+        # Step 4: Reranking & context preparation timing
+        t_rerank_start = time.time()
         best_l2_score = hybrid_docs[0][1]
 
         context_chunks = []
@@ -279,7 +328,10 @@ class RAGService:
                 sources_list.append(src_item)
 
         context_text = "\n\n".join(context_chunks)
+        t_rerank = time.time() - t_rerank_start
 
+        # Step 5: Gemini generation timing
+        t_gemini_start = time.time()
         if target_lang == "Tamil":
             lang_directive = (
                 "CRITICAL MANDATORY LANGUAGE INSTRUCTION:\n"
@@ -346,16 +398,41 @@ Final Answer (MUST BE IN {target_lang}):
 """
 
         answer_text = self._generate_gemini_content(prompt)
-        confidence_level = self.calculate_confidence(best_l2_score, answer_text)
+        t_gemini = time.time() - t_gemini_start
 
+        confidence_level = self.calculate_confidence(best_l2_score, answer_text)
         if "sorry" in answer_text.lower() and "couldn't find" in answer_text.lower():
             confidence_level = "Limited Evidence"
+
+        t_total = time.time() - t_req_start
+
+        timing_breakdown = {
+            "init_check_sec": round(t_init_check, 4),
+            "query_norm_sec": round(t_norm, 4),
+            "retrieval_sec": round(t_retrieval, 4),
+            "rerank_sec": round(t_rerank, 4),
+            "gemini_sec": round(t_gemini, 4),
+            "total_sec": round(t_total, 4)
+        }
+
+        print("\n" + "=" * 60)
+        print(f"[PURIVU RAG TIMING DIAGNOSTICS]")
+        print(f"Query: \"{question}\"")
+        print(f"- RAG Initialization check: {timing_breakdown['init_check_sec']:.4f}s")
+        print(f"- Query Normalization:       {timing_breakdown['query_norm_sec']:.4f}s")
+        print(f"- FAISS Retrieval:           {timing_breakdown['retrieval_sec']:.4f}s")
+        print(f"- Reranking & Context Build: {timing_breakdown['rerank_sec']:.4f}s")
+        print(f"- Gemini API Generation:     {timing_breakdown['gemini_sec']:.4f}s")
+        print(f"- Total Request Time:        {timing_breakdown['total_sec']:.4f}s")
+        print("=" * 60 + "\n")
 
         return {
             "answer": answer_text,
             "evidence_status": confidence_level,
             "sources": sources_list,
-            "response_language": target_lang
+            "response_language": target_lang,
+            "execution_time_seconds": round(t_total, 3),
+            "timings": timing_breakdown
         }
 
     def process_vision_image(self, image_bytes: bytes, user_question: str = None) -> Dict[str, Any]:

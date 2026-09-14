@@ -41,6 +41,8 @@ class ChatResponse(BaseModel):
     evidence_status: str = Field(..., description="Evidence confidence status (High Confidence, Moderate Confidence, Limited Evidence)")
     sources: List[SourceItem] = Field(default_factory=list, description="List of source document citations")
     response_language: Optional[str] = Field("English", description="Language of the returned response")
+    execution_time_seconds: Optional[float] = Field(None, description="Total backend execution time in seconds")
+    timings: Optional[dict] = Field(None, description="Detailed diagnostic timing breakdown in seconds")
 
 class HealthResponse(BaseModel):
     status: str = Field("ok", example="ok")

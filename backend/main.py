@@ -132,8 +132,11 @@ async def chat_endpoint(request: ChatRequest):
             answer=result["answer"],
             evidence_status=result["evidence_status"],
             sources=result["sources"],
-            response_language=result.get("response_language", "English")
+            response_language=result.get("response_language", "English"),
+            execution_time_seconds=result.get("execution_time_seconds"),
+            timings=result.get("timings")
         )
+
     except FileNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
