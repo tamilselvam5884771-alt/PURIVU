@@ -62,3 +62,18 @@ class VisionResponse(BaseModel):
     evidence_status: str = Field(..., description="RAG Evidence confidence status")
     sources: List[SourceItem] = Field(default_factory=list, description="List of source document citations")
 
+class MetricsResponse(BaseModel):
+    status: str = Field("ok", example="ok")
+    total_queries: int = Field(0, description="Total queries processed since startup")
+    cache_hits: int = Field(0, description="Total cache hits")
+    cache_hit_rate_pct: float = Field(0.0, description="Cache hit percentage")
+    avg_latency_sec: float = Field(0.0, description="Average response latency in seconds")
+    p50_latency_sec: float = Field(0.0, description="50th percentile (median) latency in seconds")
+    p95_latency_sec: float = Field(0.0, description="95th percentile latency in seconds")
+    avg_retrieval_sec: float = Field(0.0, description="Average FAISS retrieval time in seconds")
+    avg_gemini_sec: float = Field(0.0, description="Average Gemini generation time in seconds")
+    total_chunks: int = Field(0, description="Total chunks in active FAISS index")
+    index_version: str = Field("v1", description="Active vector index version hash")
+    query_paths: Optional[dict] = Field(default_factory=dict, description="Distribution of FAST vs DEEP query paths")
+
+

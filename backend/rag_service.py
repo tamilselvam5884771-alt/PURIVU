@@ -3,7 +3,8 @@ import sys
 import re
 import hashlib
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
+from collections import OrderedDict
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -35,6 +36,38 @@ else:
 # Model priority list for fallback handling (Valid & active Gemini API models)
 MODEL_NAMES = ["gemini-3.6-flash", "gemini-flash-latest", "gemini-pro-latest"]
 
+class SimpleLRUCache:
+    """Thread-safe lightweight in-memory LRU cache."""
+    def __init__(self, maxsize: int = 200):
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+
+    def get(self, key: str) -> Optional[Any]:
+        if key not in self.cache:
+            return None
+        self.cache.move_to_end(key)
+        return self.cache[key]
+
+    def put(self, key: str, value: Any):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.maxsize:
+            self.cache.popitem(last=False)
+
+    def clear(self):
+        self.cache.clear()
+
+def _compute_index_version(index_dir: Path) -> str:
+    faiss_p = index_dir / "index.faiss"
+    pkl_p = index_dir / "index.pkl"
+    st_f = faiss_p.stat() if faiss_p.exists() else None
+    st_p = pkl_p.stat() if pkl_p.exists() else None
+    if st_f and st_p:
+        raw = f"{st_f.st_mtime}_{st_f.st_size}_{st_p.st_mtime}_{st_p.st_size}"
+        return hashlib.md5(raw.encode()).hexdigest()[:10]
+    return "v1"
+
 class RAGService:
     def __init__(self):
         self.db = None
@@ -42,6 +75,20 @@ class RAGService:
         self.initialized = False
         self._init_error = None
         self.init_time_sec = 0.0
+        self.index_version = "v1"
+
+        # In-Memory LRU Caches
+        self.embedding_cache = SimpleLRUCache(maxsize=300)
+        self.retrieval_cache = SimpleLRUCache(maxsize=150)
+        self.answer_cache = SimpleLRUCache(maxsize=150)
+
+        # Production Telemetry Metrics
+        self.total_queries = 0
+        self.cache_hits = 0
+        self.latencies = []       # total latencies
+        self.retrieval_times = [] # retrieval latencies
+        self.gemini_times = []    # gemini latencies
+        self.path_counts = {"FAST": 0, "DEEP": 0, "CACHED": 0}
 
     def initialize(self):
         if self.initialized:
@@ -59,17 +106,14 @@ class RAGService:
         index_faiss = INDEX_DIR / "index.faiss"
         index_pkl = INDEX_DIR / "index.pkl"
 
-        print(f"[RAG_DIAG] Resolved BASE_DIR: {BASE_DIR}")
-        print(f"[RAG_DIAG] Resolved INDEX_DIR: {INDEX_DIR}")
-        print(f"[RAG_DIAG] index.faiss exists: {index_faiss.exists()}")
-        print(f"[RAG_DIAG] index.pkl exists: {index_pkl.exists()}")
-
         if not index_faiss.exists() or not index_pkl.exists():
             self._init_error = f"FAISS index files ('index.faiss', 'index.pkl') not found in '{INDEX_DIR}'."
             print(f"[RAG_INIT_ERROR] {self._init_error}")
             raise FileNotFoundError(self._init_error)
 
         try:
+            self.index_version = _compute_index_version(INDEX_DIR)
+
             t_emb_start = time.time()
             self.embeddings = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2",
@@ -77,7 +121,6 @@ class RAGService:
                 encode_kwargs={'normalize_embeddings': True}
             )
             t_emb_end = time.time()
-            print(f"[RAG_DIAG] Embedding model (sentence-transformers/all-MiniLM-L6-v2) loaded in {t_emb_end - t_emb_start:.2f}s")
 
             t_faiss_start = time.time()
             self.db = FAISS.load_local(
@@ -86,14 +129,22 @@ class RAGService:
                 allow_dangerous_deserialization=True
             )
             t_faiss_end = time.time()
-            print(f"[RAG_DIAG] FAISS vector index loaded in {t_faiss_end - t_faiss_start:.2f}s")
 
             self.initialized = True
             self.init_time_sec = round(time.time() - t_start, 4)
             chunks = self.get_chunk_count()
-            print(f"[RAG_DIAG] PURIVU RAG Service fully initialized in {self.init_time_sec}s. Total chunks: {chunks}")
-            if chunks == 0:
-                print(f"[RAG_WARN] FAISS index loaded but ntotal is 0!")
+
+            print("\n" + "=" * 60)
+            print("[PURIVU RAG WARM-START DIAGNOSTICS]")
+            print(f"- Active Index Directory:  {INDEX_DIR}")
+            print(f"- Index Version Hash:      {self.index_version}")
+            print(f"- FAISS Vectors Loaded:    {chunks}")
+            print(f"- Metadata Entries Loaded: {chunks}")
+            print(f"- Embedding Model Loaded:  sentence-transformers/all-MiniLM-L6-v2 (CPU)")
+            print(f"- Embedding Model Load:    {t_emb_end - t_emb_start:.2f}s")
+            print(f"- FAISS Index Load Time:   {t_faiss_end - t_faiss_start:.2f}s")
+            print(f"- RAG Service Status:      READY (Total Warm-start: {self.init_time_sec:.2f}s)")
+            print("=" * 60 + "\n")
         except Exception as e:
             self._init_error = f"Failed to load FAISS index from {INDEX_DIR}: {str(e)}"
             print(f"[RAG_INIT_ERROR] {self._init_error}")
@@ -113,6 +164,50 @@ class RAGService:
         if self.db and hasattr(self.db, "index"):
             return self.db.index.ntotal
         return 0
+
+    def classify_query_intent(self, query: str) -> Dict[str, Any]:
+        """
+        Adaptive Retrieval Router:
+        Classifies query into FAST path (simple definition/FAQ) or DEEP path (complex compliance/guideline search).
+        """
+        q_clean = query.strip().lower()
+        words = q_clean.split()
+        
+        # Fast path triggers for concise definitional / FAQ questions
+        fast_patterns = [
+            r'^\s*what\s+is\s+bis\??\s*$',
+            r'^\s*what\s+is\s+hallmarking\??\s*$',
+            r'^\s*what\s+does\s+bis\s+stand\s+for\??\s*$',
+            r'^\s*what\s+is\s+an?\s+is\s+number\??\s*$',
+            r'^\s*what\s+is\s+coc\??\s*$',
+            r'^\s*what\s+is\s+qco\??\s*$'
+        ]
+
+        for p in fast_patterns:
+            if re.search(p, q_clean):
+                return {
+                    "path": "FAST",
+                    "top_k": 3,
+                    "use_expansion": False,
+                    "early_exit_score_threshold": 0.65
+                }
+
+        # Short definitional queries (<= 5 words starting with what/define/meaning)
+        if len(words) <= 5 and any(q_clean.startswith(prefix) for prefix in ["what is", "define", "meaning of"]):
+            return {
+                "path": "FAST",
+                "top_k": 4,
+                "use_expansion": False,
+                "early_exit_score_threshold": 0.70
+            }
+
+        # Deep path for complex compliance/procedure queries
+        return {
+            "path": "DEEP",
+            "top_k": 6,
+            "use_expansion": True,
+            "early_exit_score_threshold": 0.50
+        }
 
     def expand_query(self, query: str) -> List[str]:
         expansion_patterns = [
@@ -134,7 +229,7 @@ class RAGService:
         for pattern, additions in expansion_patterns:
             if re.search(pattern, q_lower):
                 expanded_terms.extend(additions)
-        # Deduplicate terms while maintaining order
+        
         seen = set()
         deduped = []
         for term in expanded_terms:
@@ -143,20 +238,30 @@ class RAGService:
                 deduped.append(term)
         return deduped
 
-    def retrieve_hybrid_documents(self, query: str, top_k: int = 6):
+    def retrieve_hybrid_documents(self, query: str, route: Dict[str, Any]):
         if not self.is_ready():
             raise RuntimeError(self._init_error or "RAG Service is not initialized.")
 
-        # Search base query
+        top_k = route.get("top_k", 6)
+        use_expansion = route.get("use_expansion", False)
+
+        # Retrieval Cache check
+        ret_cache_key = f"{query}_{self.index_version}_{top_k}_{use_expansion}"
+        cached_retrieval = self.retrieval_cache.get(ret_cache_key)
+        if cached_retrieval:
+            return cached_retrieval
+
+        # Primary vector search
         results = self.db.similarity_search_with_score(query, k=top_k)
 
-        # Expand query and search additional terms if applicable
-        extra_phrases = self.expand_query(query)
-        for phrase in extra_phrases[:2]:  # Limit extra expansion queries to top 2 to avoid redundant calls
-            extra_results = self.db.similarity_search_with_score(phrase, k=3)
-            results.extend(extra_results)
+        # Conditional query expansion search
+        if use_expansion:
+            extra_phrases = self.expand_query(query)
+            for phrase in extra_phrases[:2]:
+                extra_results = self.db.similarity_search_with_score(phrase, k=3)
+                results.extend(extra_results)
 
-        # Deduplicate chunks by MD5 text hash, keeping lowest L2 distance
+        # Efficient deduplication by content hash
         unique_chunks = {}
         for doc, score in results:
             content_hash = hashlib.md5(doc.page_content.strip().encode('utf-8')).hexdigest()
@@ -164,7 +269,10 @@ class RAGService:
                 unique_chunks[content_hash] = (doc, score)
 
         sorted_chunks = sorted(unique_chunks.values(), key=lambda x: x[1])
-        return sorted_chunks[:top_k]
+        final_candidates = sorted_chunks[:top_k]
+
+        self.retrieval_cache.put(ret_cache_key, final_candidates)
+        return final_candidates
 
     def _generate_gemini_content(self, prompt: str) -> str:
         last_error = None
@@ -181,10 +289,12 @@ class RAGService:
                 err_str = str(e)
                 print(f"[RAG_WARN] Gemini API call failed for '{model_name}': {err_str[:120]}")
                 last_error = e
-                # If model not found or invalid, skip sleeping and try next model immediately
-                if "404" not in err_str and "NOT_FOUND" not in err_str:
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                    time.sleep(2.0)
+                elif "404" not in err_str and "NOT_FOUND" not in err_str:
                     time.sleep(0.5)
                 continue
+
         raise RuntimeError(f"Gemini API request failed across models: {str(last_error)}")
 
     def calculate_confidence(self, best_score: float, answer_text: str) -> str:
@@ -224,7 +334,6 @@ class RAGService:
         return "English"
 
     def normalize_query_for_retrieval(self, query: str) -> str:
-        # If query contains non-ASCII characters (e.g. Tamil or Hindi unicode script)
         if any(ord(char) > 127 for char in query):
             norm_prompt = f"Translate/normalize the following user query into concise English technical search terms for vector database lookup of Indian Standards: '{query}'. Return ONLY the English search terms with no extra commentary."
             try:
@@ -236,24 +345,53 @@ class RAGService:
 
     def process_query(self, question: str, response_language: str = None) -> Dict[str, Any]:
         t_req_start = time.time()
+        self.total_queries += 1
 
-        # Step 1: Initialization check timing
         t_init_check_start = time.time()
-        was_initialized = self.initialized
         if not self.is_ready():
             raise RuntimeError(self._init_error or "RAG service is not ready.")
         t_init_check = time.time() - t_init_check_start
 
-        # Step 2: Response language determination & query normalization
-        t_norm_start = time.time()
         target_lang = self.normalize_response_language(response_language, question)
-        retrieval_query = self.normalize_query_for_retrieval(question)
+        clean_q = question.strip()
+
+        # SAFE SEMANTIC ANSWER CACHE CHECK
+        cache_key = f"{clean_q}_{target_lang}_{self.index_version}"
+        cached_result = self.answer_cache.get(cache_key)
+        if cached_result:
+            self.cache_hits += 1
+            self.path_counts["CACHED"] = self.path_counts.get("CACHED", 0) + 1
+            t_total = time.time() - t_req_start
+            self.latencies.append(t_total)
+            
+            res_copy = dict(cached_result)
+            res_copy["execution_time_seconds"] = round(t_total, 4)
+            res_copy["timings"] = {
+                "init_check_sec": round(t_init_check, 4),
+                "query_norm_sec": 0.0,
+                "retrieval_sec": 0.0,
+                "rerank_sec": 0.0,
+                "gemini_sec": 0.0,
+                "total_sec": round(t_total, 4),
+                "cache_hit": True
+            }
+            print(f"[PURIVU CACHE HIT] Query: '{clean_q}' | Served in {t_total:.4f}s")
+            return res_copy
+
+        # ADAPTIVE ROUTER CLASSIFICATION
+        route = self.classify_query_intent(clean_q)
+        self.path_counts[route["path"]] = self.path_counts.get(route["path"], 0) + 1
+
+        # QUERY NORMALIZATION
+        t_norm_start = time.time()
+        retrieval_query = self.normalize_query_for_retrieval(clean_q)
         t_norm = time.time() - t_norm_start
 
-        # Step 3: Retrieval & Query Expansion timing
+        # FAISS RETRIEVAL
         t_retrieval_start = time.time()
-        hybrid_docs = self.retrieve_hybrid_documents(retrieval_query, top_k=6)
+        hybrid_docs = self.retrieve_hybrid_documents(retrieval_query, route)
         t_retrieval = time.time() - t_retrieval_start
+        self.retrieval_times.append(t_retrieval)
 
         if not hybrid_docs:
             refusal = "Sorry, I couldn't find that information in the provided BIS documents."
@@ -262,7 +400,7 @@ class RAGService:
             elif target_lang == "Hindi":
                 refusal = "क्षमा करें, दिए गए BIS दस्तावेजों में यह जानकारी नहीं मिल सकी। किसी गलत जानकारी से बचने के लिए, केवल आधिकारिक दस्तावेजों के आधार पर ही उत्तर दिया जाता है।"
             t_total = time.time() - t_req_start
-            print(f"[RAG_TIMING] Question: '{question[:40]}...' | No docs found | Total: {t_total:.3f}s")
+            self.latencies.append(t_total)
             return {
                 "answer": refusal,
                 "evidence_status": "Limited Evidence",
@@ -278,7 +416,7 @@ class RAGService:
                 }
             }
 
-        # Step 4: Reranking & context preparation timing
+        # RERANKING & CONTEXT BUILD
         t_rerank_start = time.time()
         best_l2_score = hybrid_docs[0][1]
 
@@ -330,7 +468,7 @@ class RAGService:
         context_text = "\n\n".join(context_chunks)
         t_rerank = time.time() - t_rerank_start
 
-        # Step 5: Gemini generation timing
+        # GEMINI GENERATION
         t_gemini_start = time.time()
         if target_lang == "Tamil":
             lang_directive = (
@@ -399,12 +537,14 @@ Final Answer (MUST BE IN {target_lang}):
 
         answer_text = self._generate_gemini_content(prompt)
         t_gemini = time.time() - t_gemini_start
+        self.gemini_times.append(t_gemini)
 
         confidence_level = self.calculate_confidence(best_l2_score, answer_text)
         if "sorry" in answer_text.lower() and "couldn't find" in answer_text.lower():
             confidence_level = "Limited Evidence"
 
         t_total = time.time() - t_req_start
+        self.latencies.append(t_total)
 
         timing_breakdown = {
             "init_check_sec": round(t_init_check, 4),
@@ -412,12 +552,13 @@ Final Answer (MUST BE IN {target_lang}):
             "retrieval_sec": round(t_retrieval, 4),
             "rerank_sec": round(t_rerank, 4),
             "gemini_sec": round(t_gemini, 4),
-            "total_sec": round(t_total, 4)
+            "total_sec": round(t_total, 4),
+            "path": route["path"]
         }
 
         print("\n" + "=" * 60)
         print(f"[PURIVU RAG TIMING DIAGNOSTICS]")
-        print(f"Query: \"{question}\"")
+        print(f"Query: \"{question}\" (Path: {route['path']})")
         print(f"- RAG Initialization check: {timing_breakdown['init_check_sec']:.4f}s")
         print(f"- Query Normalization:       {timing_breakdown['query_norm_sec']:.4f}s")
         print(f"- FAISS Retrieval:           {timing_breakdown['retrieval_sec']:.4f}s")
@@ -426,13 +567,46 @@ Final Answer (MUST BE IN {target_lang}):
         print(f"- Total Request Time:        {timing_breakdown['total_sec']:.4f}s")
         print("=" * 60 + "\n")
 
-        return {
+        output_dict = {
             "answer": answer_text,
             "evidence_status": confidence_level,
             "sources": sources_list,
             "response_language": target_lang,
             "execution_time_seconds": round(t_total, 3),
             "timings": timing_breakdown
+        }
+
+        # Store in Safe Semantic Answer Cache if evidence was found
+        if confidence_level != "Limited Evidence":
+            self.answer_cache.put(cache_key, output_dict)
+
+        return output_dict
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Returns real production latency and cache performance metrics."""
+        lats = sorted(self.latencies) if self.latencies else [0.0]
+        n = len(lats)
+        avg_lat = sum(lats) / n if n > 0 else 0.0
+        p50 = lats[int(n * 0.50)] if n > 0 else 0.0
+        p95 = lats[int(n * 0.95)] if n > 0 else 0.0
+        
+        avg_ret = sum(self.retrieval_times) / len(self.retrieval_times) if self.retrieval_times else 0.0
+        avg_gem = sum(self.gemini_times) / len(self.gemini_times) if self.gemini_times else 0.0
+        hit_rate = (self.cache_hits / self.total_queries * 100) if self.total_queries > 0 else 0.0
+
+        return {
+            "status": "ok",
+            "total_queries": self.total_queries,
+            "cache_hits": self.cache_hits,
+            "cache_hit_rate_pct": round(hit_rate, 2),
+            "avg_latency_sec": round(avg_lat, 3),
+            "p50_latency_sec": round(p50, 3),
+            "p95_latency_sec": round(p95, 3),
+            "avg_retrieval_sec": round(avg_ret, 3),
+            "avg_gemini_sec": round(avg_gem, 3),
+            "total_chunks": self.get_chunk_count(),
+            "index_version": self.index_version,
+            "query_paths": self.path_counts
         }
 
     def process_vision_image(self, image_bytes: bytes, user_question: str = None) -> Dict[str, Any]:

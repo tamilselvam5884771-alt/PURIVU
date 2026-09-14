@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, status, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.schemas import ChatRequest, ChatResponse, HealthResponse, VisionResponse, ProductInfo
+from backend.schemas import ChatRequest, ChatResponse, HealthResponse, VisionResponse, ProductInfo, MetricsResponse
 from backend.rag_service import rag_service
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -68,6 +68,7 @@ async def root():
         "service": "PURIVU API - BIS Saathi Assistant",
         "status": "online",
         "health": "/api/health",
+        "metrics": "/api/metrics",
         "docs": "/docs"
     }
 
@@ -103,6 +104,24 @@ async def get_health():
         rag="ready",
         total_chunks=rag_service.get_chunk_count()
     )
+
+# -----------------------------
+# Real-Time Latency & Metrics Endpoint
+# -----------------------------
+@app.get(
+    "/api/metrics",
+    response_model=MetricsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Production Latency & Telemetry Metrics",
+    tags=["Telemetry"]
+)
+async def get_metrics():
+    """
+    Returns production latency stats (p50, p95, avg), cache hit rate, and query path distribution.
+    """
+    metrics = rag_service.get_metrics()
+    return MetricsResponse(**metrics)
+
 
 # -----------------------------
 # Chat API Endpoint
