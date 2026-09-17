@@ -48,6 +48,9 @@ class HealthResponse(BaseModel):
     status: str = Field("ok", example="ok")
     service: str = Field("PURIVU", example="PURIVU")
     rag: str = Field("ready", example="ready")
+    gemini: Optional[str] = Field("configured", example="configured")
+    text_model: Optional[str] = Field(None, description="Configured Gemini text model name")
+    vision_model: Optional[str] = Field(None, description="Configured Gemini vision model name")
     total_chunks: Optional[int] = Field(None, description="Number of indexed chunks loaded in FAISS")
 
 class ProductInfo(BaseModel):

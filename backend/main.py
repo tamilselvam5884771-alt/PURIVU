@@ -94,6 +94,9 @@ async def get_health():
                 "status": "error",
                 "service": "PURIVU",
                 "rag": "not_ready",
+                "gemini": rag_service.get_gemini_status(),
+                "text_model": rag_service.get_text_model(),
+                "vision_model": rag_service.get_vision_model(),
                 "error": err_detail
             }
         )
@@ -102,6 +105,9 @@ async def get_health():
         status="ok",
         service="PURIVU",
         rag="ready",
+        gemini=rag_service.get_gemini_status(),
+        text_model=rag_service.get_text_model(),
+        vision_model=rag_service.get_vision_model(),
         total_chunks=rag_service.get_chunk_count()
     )
 

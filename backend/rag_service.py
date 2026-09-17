@@ -33,8 +33,28 @@ elif (FAISS_DEF_DIR / "index.faiss").exists() and (FAISS_DEF_DIR / "index.pkl").
 else:
     INDEX_DIR = FAISS_BIS_DIR
 
-# Model priority list for fallback handling (Valid & active Gemini API models)
-MODEL_NAMES = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+# Centralized Gemini model configuration (environment configurable with active defaults)
+DEFAULT_TEXT_MODEL = "gemini-3.6-flash"
+DEFAULT_VISION_MODEL = "gemini-3.6-flash"
+DEFAULT_TEXT_FALLBACKS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+DEFAULT_VISION_FALLBACKS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+
+def get_text_models() -> List[str]:
+    primary = os.getenv("GEMINI_TEXT_MODEL", DEFAULT_TEXT_MODEL).strip()
+    models = [primary]
+    for m in DEFAULT_TEXT_FALLBACKS:
+        if m not in models:
+            models.append(m)
+    return models
+
+def get_vision_models() -> List[str]:
+    primary = os.getenv("GEMINI_VISION_MODEL", DEFAULT_VISION_MODEL).strip()
+    models = [primary]
+    for m in DEFAULT_VISION_FALLBACKS:
+        if m not in models:
+            models.append(m)
+    return models
+
 
 class SimpleLRUCache:
     """Thread-safe lightweight in-memory LRU cache."""
@@ -276,7 +296,8 @@ class RAGService:
 
     def _generate_gemini_content(self, prompt: str) -> str:
         last_error = None
-        for model_name in MODEL_NAMES:
+        models = get_text_models()
+        for model_name in models:
             try:
                 t0 = time.time()
                 model = genai.GenerativeModel(model_name)
@@ -296,6 +317,17 @@ class RAGService:
                 continue
 
         raise RuntimeError(f"Gemini API request failed across models: {str(last_error)}")
+
+    def get_text_model(self) -> str:
+        return os.getenv("GEMINI_TEXT_MODEL", DEFAULT_TEXT_MODEL).strip()
+
+    def get_vision_model(self) -> str:
+        return os.getenv("GEMINI_VISION_MODEL", DEFAULT_VISION_MODEL).strip()
+
+    def get_gemini_status(self) -> str:
+        api_key = os.getenv("GEMINI_API_KEY")
+        return "configured" if api_key and api_key.strip() else "not_configured"
+
 
     def calculate_confidence(self, best_score: float, answer_text: str) -> str:
         if "sorry" in answer_text.lower() and "couldn't find" in answer_text.lower():
@@ -641,7 +673,8 @@ CRITICAL RULES:
         last_error = None
         vision_json = None
 
-        for model_name in MODEL_NAMES:
+        models = get_vision_models()
+        for model_name in models:
             try:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content([vision_prompt, pil_image])
@@ -651,11 +684,15 @@ CRITICAL RULES:
                     clean_text = re.sub(r'^```(json)?', '', clean_text, flags=re.IGNORECASE).strip()
                     clean_text = re.sub(r'```$', '', clean_text).strip()
                     vision_json = json.loads(clean_text)
+                    print(f"[VISION_DIAG] Vision API call succeeded using '{model_name}'")
                     break
             except Exception as e:
+                err_str = str(e)
+                print(f"[VISION_WARN] Vision API call failed for '{model_name}': {err_str[:120]}")
                 last_error = e
                 time.sleep(1)
                 continue
+
 
         if not vision_json:
             # Fallback product identification if Vision API JSON parsing fails
