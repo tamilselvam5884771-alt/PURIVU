@@ -23,8 +23,8 @@ if not GEMINI_API_KEY:
     st.error("⚠️ GEMINI_API_KEY is not set. Please set it in your .env file.")
     st.stop()
 
-DEFAULT_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.6-flash").strip()
-MODEL_NAMES = list(dict.fromkeys([DEFAULT_TEXT_MODEL, "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]))
+DEFAULT_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash-lite").strip()
+MODEL_NAMES = list(dict.fromkeys([DEFAULT_TEXT_MODEL, "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.6-flash", "gemini-3.5-flash"]))
 
 def generate_with_fallback(prompt):
     last_err = None

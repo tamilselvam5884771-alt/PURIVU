@@ -34,10 +34,11 @@ else:
     INDEX_DIR = FAISS_BIS_DIR
 
 # Centralized Gemini model configuration (environment configurable with active defaults)
-DEFAULT_TEXT_MODEL = "gemini-3.6-flash"
-DEFAULT_VISION_MODEL = "gemini-3.6-flash"
-DEFAULT_TEXT_FALLBACKS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
-DEFAULT_VISION_FALLBACKS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+DEFAULT_TEXT_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_VISION_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_TEXT_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.5-flash", "gemini-3.6-flash"]
+DEFAULT_VISION_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.5-flash", "gemini-3.6-flash"]
+
 
 def get_text_models() -> List[str]:
     primary = os.getenv("GEMINI_TEXT_MODEL", DEFAULT_TEXT_MODEL).strip()
@@ -310,13 +311,15 @@ class RAGService:
                 err_str = str(e)
                 print(f"[RAG_WARN] Gemini API call failed for '{model_name}': {err_str[:120]}")
                 last_error = e
+                # On 429 Rate Limit / Quota Exceeded, immediately switch to next model without waiting!
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
-                    time.sleep(2.0)
+                    continue
                 elif "404" not in err_str and "NOT_FOUND" not in err_str:
-                    time.sleep(0.5)
+                    time.sleep(0.2)
                 continue
 
         raise RuntimeError(f"Gemini API request failed across models: {str(last_error)}")
+
 
     def get_text_model(self) -> str:
         return os.getenv("GEMINI_TEXT_MODEL", DEFAULT_TEXT_MODEL).strip()
@@ -366,7 +369,8 @@ class RAGService:
         return "English"
 
     def normalize_query_for_retrieval(self, query: str) -> str:
-        if any(ord(char) > 127 for char in query):
+        # Only translate if query contains non-Latin multilingual scripts (e.g. Tamil or Hindi)
+        if any('\u0b80' <= c <= '\u0bff' or '\u0900' <= c <= '\u097f' for c in query):
             norm_prompt = f"Translate/normalize the following user query into concise English technical search terms for vector database lookup of Indian Standards: '{query}'. Return ONLY the English search terms with no extra commentary."
             try:
                 english_terms = self._generate_gemini_content(norm_prompt).strip()
@@ -374,6 +378,7 @@ class RAGService:
             except Exception:
                 return query
         return query
+
 
     def process_query(self, question: str, response_language: str = None) -> Dict[str, Any]:
         t_req_start = time.time()
@@ -387,8 +392,9 @@ class RAGService:
         target_lang = self.normalize_response_language(response_language, question)
         clean_q = question.strip()
 
-        # SAFE SEMANTIC ANSWER CACHE CHECK
-        cache_key = f"{clean_q}_{target_lang}_{self.index_version}"
+        # SAFE SEMANTIC ANSWER CACHE CHECK (Case-insensitive)
+        cache_key = f"{clean_q.lower()}_{target_lang}_{self.index_version}"
+
         cached_result = self.answer_cache.get(cache_key)
         if cached_result:
             self.cache_hits += 1
