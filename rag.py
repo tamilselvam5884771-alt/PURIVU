@@ -167,10 +167,15 @@ def build_bis_index():
     print(f"✅ Generated {len(chunked_docs)} unique document chunks.")
 
     print(f"🧠 Generating Multilingual Embeddings ({EMBEDDING_MODEL_NAME})...")
+    model_kwargs = {'device': 'cpu'}
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        model_kwargs['token'] = hf_token
+
     embeddings = E5Embeddings(
         model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': True}
+        model_kwargs=model_kwargs,
+        encode_kwargs={'normalize_embeddings': True, 'batch_size': 16}
     )
 
     print("💾 Creating FAISS Vector Database...")

@@ -3,7 +3,7 @@ import sys
 import re
 import hashlib
 import streamlit as st
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -23,6 +23,8 @@ if not GEMINI_API_KEY:
     st.error("⚠️ GEMINI_API_KEY is not set. Please set it in your .env file.")
     st.stop()
 
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
 DEFAULT_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash-lite").strip()
 MODEL_NAMES = list(dict.fromkeys([DEFAULT_TEXT_MODEL, "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.6-flash", "gemini-3.5-flash"]))
 
@@ -30,8 +32,7 @@ def generate_with_fallback(prompt):
     last_err = None
     for mname in MODEL_NAMES:
         try:
-            m = genai.GenerativeModel(mname)
-            res = m.generate_content(prompt)
+            res = gemini_client.models.generate_content(model=mname, contents=prompt)
             if res and res.text:
                 return res.text
         except Exception as e:

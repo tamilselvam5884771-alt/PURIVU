@@ -1,5 +1,5 @@
 streamlit
-google-generativeai
+google-genai
 langchain
 langchain-community
 langchain-text-splitters
@@ -12,4 +12,3 @@ uvicorn
 pydantic
 python-multipart
 pillow
-streamlit

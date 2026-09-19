@@ -3,6 +3,7 @@ import sys
 import re
 import hashlib
 import time
+import gc
 from typing import Dict, Any, List, Optional, Tuple
 from collections import OrderedDict
 
@@ -11,7 +12,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 from dotenv import load_dotenv
 
-import google.generativeai as genai
+from google import genai
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
@@ -108,6 +109,7 @@ class RAGService:
     def __init__(self):
         self.db = None
         self.embeddings = None
+        self.gemini_client = None
         self.initialized = False
         self._init_error = None
         self.init_time_sec = 0.0
@@ -137,7 +139,7 @@ class RAGService:
             print(f"[RAG_INIT_ERROR] {self._init_error}")
             raise ValueError(self._init_error)
 
-        genai.configure(api_key=api_key)
+        self.gemini_client = genai.Client(api_key=api_key)
 
         index_faiss = INDEX_DIR / "index.faiss"
         index_pkl = INDEX_DIR / "index.pkl"
@@ -174,10 +176,15 @@ class RAGService:
             self.index_version = _compute_index_version(INDEX_DIR)
 
             t_emb_start = time.time()
+            model_kwargs = {'device': 'cpu'}
+            hf_token = os.getenv("HF_TOKEN")
+            if hf_token:
+                model_kwargs['token'] = hf_token
+
             self.embeddings = E5Embeddings(
                 model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': True}
+                model_kwargs=model_kwargs,
+                encode_kwargs={'normalize_embeddings': True, 'batch_size': 16}
             )
             t_emb_end = time.time()
 
@@ -725,8 +732,10 @@ class RAGService:
         for model_name in models:
             try:
                 t0 = time.time()
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(prompt)
+                response = self.gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
                 if response and response.text:
                     dt = time.time() - t0
                     print(f"[RAG_DIAG] Gemini API call succeeded using '{model_name}' in {dt:.2f}s")
@@ -1232,15 +1241,11 @@ Final Answer (in {target_lang}):
     def process_vision_image(self, image_bytes: bytes, user_question: str = None) -> Dict[str, Any]:
         import io
         import json
+        import gc
         from PIL import Image
 
         if not self.is_ready():
             raise RuntimeError(self._init_error or "RAG Service is not ready.")
-
-        try:
-            pil_image = Image.open(io.BytesIO(image_bytes))
-        except Exception as e:
-            raise ValueError(f"Invalid image file format: {str(e)}")
 
         vision_prompt = """
 You are an expert product recognition vision system. Analyze the provided product image carefully.
@@ -1260,25 +1265,34 @@ CRITICAL RULES:
 
         last_error = None
         vision_json = None
-
         models = get_vision_models()
-        for model_name in models:
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content([vision_prompt, pil_image])
-                if response and response.text:
-                    clean_text = response.text.strip()
-                    clean_text = re.sub(r'^```(json)?', '', clean_text, flags=re.IGNORECASE).strip()
-                    clean_text = re.sub(r'```$', '', clean_text).strip()
-                    vision_json = json.loads(clean_text)
-                    print(f"[VISION_DIAG] Vision API call succeeded using '{model_name}'")
-                    break
-            except Exception as e:
-                err_str = str(e)
-                print(f"[VISION_WARN] Vision API call failed for '{model_name}': {err_str[:120]}")
-                last_error = e
-                time.sleep(1)
-                continue
+
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as pil_image:
+                for model_name in models:
+                    try:
+                        response = self.gemini_client.models.generate_content(
+                            model=model_name,
+                            contents=[vision_prompt, pil_image]
+                        )
+                        if response and response.text:
+                            clean_text = response.text.strip()
+                            clean_text = re.sub(r'^```(json)?', '', clean_text, flags=re.IGNORECASE).strip()
+                            clean_text = re.sub(r'```$', '', clean_text).strip()
+                            vision_json = json.loads(clean_text)
+                            print(f"[VISION_DIAG] Vision API call succeeded using '{model_name}'")
+                            break
+                    except Exception as e:
+                        err_str = str(e)
+                        print(f"[VISION_WARN] Vision API call failed for '{model_name}': {err_str[:120]}")
+                        last_error = e
+                        time.sleep(0.5)
+                        continue
+        except Exception as e:
+            raise ValueError(f"Invalid image file format: {str(e)}")
+        finally:
+            del image_bytes
+            gc.collect()
 
         if not vision_json:
             vision_json = {
