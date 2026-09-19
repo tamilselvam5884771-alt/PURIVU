@@ -14,6 +14,9 @@ ENV/
 .pytest_cache/
 *.log
 
+# Local Backups
+faiss_index_bis_minilm_backup/
+
 # Node & Frontend Build
 node_modules/
 frontend/node_modules/

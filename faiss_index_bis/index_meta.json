@@ -1,0 +1,6 @@
+{
+  "embedding_model_name": "intfloat/multilingual-e5-base",
+  "dimension": 768,
+  "total_chunks": 2239,
+  "built_at": "2026-09-18T11:56:57.817654"
+}

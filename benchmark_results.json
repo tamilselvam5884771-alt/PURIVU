@@ -1,0 +1,46 @@
+{
+  "new_model": {
+    "English": {
+      "recall_at_3_pct": 90.0,
+      "recall_at_5_pct": 90.0,
+      "avg_latency_sec": 0.0675
+    },
+    "Tamil": {
+      "recall_at_3_pct": 90.0,
+      "recall_at_5_pct": 90.0,
+      "avg_latency_sec": 0.0617
+    },
+    "Hindi": {
+      "recall_at_3_pct": 70.0,
+      "recall_at_5_pct": 70.0,
+      "avg_latency_sec": 0.0479
+    },
+    "overall": {
+      "recall_at_3_pct": 83.3,
+      "recall_at_5_pct": 83.3,
+      "avg_retrieval_sec": 0.059
+    }
+  },
+  "old_model": {
+    "English": {
+      "recall_at_3_pct": 80.0,
+      "recall_at_5_pct": 90.0,
+      "avg_latency_sec": 0.0183
+    },
+    "Tamil": {
+      "recall_at_3_pct": 50.0,
+      "recall_at_5_pct": 50.0,
+      "avg_latency_sec": 0.0154
+    },
+    "Hindi": {
+      "recall_at_3_pct": 10.0,
+      "recall_at_5_pct": 10.0,
+      "avg_latency_sec": 0.0159
+    },
+    "overall": {
+      "recall_at_3_pct": 46.7,
+      "recall_at_5_pct": 50.0,
+      "avg_retrieval_sec": 0.0166
+    }
+  }
+}

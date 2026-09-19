@@ -2,6 +2,9 @@ import os
 import sys
 import hashlib
 import re
+import json
+import datetime
+from typing import List
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -13,10 +16,24 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from pathlib import Path
+from backend.config import EMBEDDING_MODEL_NAME, get_embedding_dimension
 
 BASE_DIR = Path(__file__).resolve().parent
 BIS_DATA_DIR = BASE_DIR / "data" / "bis"
 OUTPUT_INDEX_DIR = BASE_DIR / "faiss_index_bis"
+
+class E5Embeddings(HuggingFaceEmbeddings):
+    """
+    Custom E5 Embeddings wrapper for SentenceTransformers.
+    Prepend 'passage: ' for documents and 'query: ' for user queries.
+    """
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        formatted = [t if t.startswith("passage: ") else f"passage: {t}" for t in texts]
+        return super().embed_documents(formatted)
+
+    def embed_query(self, text: str) -> List[float]:
+        formatted = text if text.startswith("query: ") else f"query: {text}"
+        return super().embed_query(formatted)
 
 def determine_category(filename, text):
     fn = filename.lower()
@@ -44,7 +61,6 @@ def clean_title(filename):
     return name.title()
 
 def extract_identifiers(text):
-    # Regex extractors for identifiers
     is_matches = re.findall(r'\bIS\s*[:/-]?\s*\d+(?:\s*\(Part\s*\d+\))?(?::\s*\d{4})?\b', text, re.IGNORECASE)
     section_matches = re.findall(r'\bsection\s+\d+(?:\(\d+\))?\b', text, re.IGNORECASE)
     clause_matches = re.findall(r'\bclause\s+\d+(?:\.\d+)*\b', text, re.IGNORECASE)
@@ -80,7 +96,6 @@ def load_bis_documents():
             reader = pypdf.PdfReader(filepath)
             total_pages = len(reader.pages)
             
-            # Extract full text first to check for duplicates via MD5 hash
             full_text = ""
             page_texts = []
             for page_idx, page in enumerate(reader.pages):
@@ -104,7 +119,6 @@ def load_bis_documents():
             
             seen_hashes[text_hash] = filename
             
-            # Process non-duplicate document pages
             for page_idx, text in enumerate(page_texts):
                 page_num = page_idx + 1
                 if text.strip():
@@ -138,8 +152,6 @@ def build_bis_index():
     print(f"\n📊 DEDUPLICATION REPORT:")
     print(f"  - Unique documents indexed: {len(set(doc.metadata['source_document'] for doc in raw_docs))}")
     print(f"  - Duplicate documents detected & skipped: {len(duplicate_files)}")
-    for d in duplicate_files:
-        print(f"    • {d['filename']} (Duplicate of {d['duplicate_of']})")
     
     if not raw_docs:
         print("❌ No valid documents extracted. Aborting index build.")
@@ -154,21 +166,33 @@ def build_bis_index():
     chunked_docs = splitter.split_documents(raw_docs)
     print(f"✅ Generated {len(chunked_docs)} unique document chunks.")
 
-    print("🧠 Generating HuggingFace Embeddings (sentence-transformers/all-MiniLM-L6-v2)...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    print(f"🧠 Generating Multilingual Embeddings ({EMBEDDING_MODEL_NAME})...")
+    embeddings = E5Embeddings(
+        model_name=EMBEDDING_MODEL_NAME,
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={'normalize_embeddings': True}
     )
 
     print("💾 Creating FAISS Vector Database...")
     db = FAISS.from_documents(chunked_docs, embeddings)
     
+    OUTPUT_INDEX_DIR.mkdir(parents=True, exist_ok=True)
     db.save_local(OUTPUT_INDEX_DIR)
-    print(f"🎉 BIS Vector Database saved successfully to '{OUTPUT_INDEX_DIR}'!")
     
-    if failed_files:
-        print("\n⚠️ Files with extraction issues:")
-        for f in failed_files:
-            print(f"  - {f['filename']}: {f['reason']}")
+    dimension = get_embedding_dimension(EMBEDDING_MODEL_NAME)
+    meta_info = {
+        "embedding_model_name": EMBEDDING_MODEL_NAME,
+        "dimension": dimension,
+        "total_chunks": len(chunked_docs),
+        "built_at": datetime.datetime.now().isoformat()
+    }
+    
+    meta_file = OUTPUT_INDEX_DIR / "index_meta.json"
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(meta_info, f, indent=2)
+
+    print(f"🎉 BIS Vector Database saved successfully to '{OUTPUT_INDEX_DIR}'!")
+    print(f"   Model: {EMBEDDING_MODEL_NAME} | Dimension: {dimension} | Chunks: {len(chunked_docs)}")
 
 if __name__ == "__main__":
     build_bis_index()

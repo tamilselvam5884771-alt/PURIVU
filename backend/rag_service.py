@@ -33,12 +33,11 @@ elif (FAISS_DEF_DIR / "index.faiss").exists() and (FAISS_DEF_DIR / "index.pkl").
 else:
     INDEX_DIR = FAISS_BIS_DIR
 
-# Centralized Gemini model configuration (environment configurable with active defaults)
+# Centralized Gemini model configuration
 DEFAULT_TEXT_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_VISION_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_TEXT_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.5-flash", "gemini-3.6-flash"]
 DEFAULT_VISION_FALLBACKS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.5-flash", "gemini-3.6-flash"]
-
 
 def get_text_models() -> List[str]:
     primary = os.getenv("GEMINI_TEXT_MODEL", DEFAULT_TEXT_MODEL).strip()
@@ -55,7 +54,6 @@ def get_vision_models() -> List[str]:
         if m not in models:
             models.append(m)
     return models
-
 
 class SimpleLRUCache:
     """Thread-safe lightweight in-memory LRU cache."""
@@ -88,6 +86,23 @@ def _compute_index_version(index_dir: Path) -> str:
         raw = f"{st_f.st_mtime}_{st_f.st_size}_{st_p.st_mtime}_{st_p.st_size}"
         return hashlib.md5(raw.encode()).hexdigest()[:10]
     return "v1"
+
+import json
+import datetime
+from backend.config import EMBEDDING_MODEL_NAME, get_embedding_dimension
+
+class E5Embeddings(HuggingFaceEmbeddings):
+    """
+    Custom E5 Embeddings wrapper for SentenceTransformers.
+    Prepend 'passage: ' for documents and 'query: ' for user queries.
+    """
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        formatted = [t if t.startswith("passage: ") else f"passage: {t}" for t in texts]
+        return super().embed_documents(formatted)
+
+    def embed_query(self, text: str) -> List[float]:
+        formatted = text if text.startswith("query: ") else f"query: {text}"
+        return super().embed_query(formatted)
 
 class RAGService:
     def __init__(self):
@@ -126,18 +141,41 @@ class RAGService:
 
         index_faiss = INDEX_DIR / "index.faiss"
         index_pkl = INDEX_DIR / "index.pkl"
+        meta_file = INDEX_DIR / "index_meta.json"
 
         if not index_faiss.exists() or not index_pkl.exists():
             self._init_error = f"FAISS index files ('index.faiss', 'index.pkl') not found in '{INDEX_DIR}'."
             print(f"[RAG_INIT_ERROR] {self._init_error}")
             raise FileNotFoundError(self._init_error)
 
+        # Validate index metadata against configured model & dimension
+        if meta_file.exists():
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                expected_dim = get_embedding_dimension(EMBEDDING_MODEL_NAME)
+                idx_dim = meta.get("dimension")
+                idx_model = meta.get("embedding_model_name")
+                
+                if idx_dim != expected_dim or idx_model != EMBEDDING_MODEL_NAME:
+                    self._init_error = (
+                        f"FAISS index validation mismatch! "
+                        f"Configured model '{EMBEDDING_MODEL_NAME}' (dim {expected_dim}) "
+                        f"does not match index model '{idx_model}' (dim {idx_dim}). "
+                        f"Please rebuild FAISS index using 'python rag.py'."
+                    )
+                    print(f"[RAG_INIT_ERROR] {self._init_error}")
+                    raise RuntimeError(self._init_error)
+            except Exception as e:
+                if isinstance(e, RuntimeError): raise e
+                print(f"[RAG_INIT_WARN] Unable to parse index_meta.json: {e}")
+
         try:
             self.index_version = _compute_index_version(INDEX_DIR)
 
             t_emb_start = time.time()
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
+            self.embeddings = E5Embeddings(
+                model_name=EMBEDDING_MODEL_NAME,
                 model_kwargs={'device': 'cpu'},
                 encode_kwargs={'normalize_embeddings': True}
             )
@@ -156,12 +194,12 @@ class RAGService:
             chunks = self.get_chunk_count()
 
             print("\n" + "=" * 60)
-            print("[PURIVU RAG WARM-START DIAGNOSTICS]")
+            print("[PURIVU MULTILINGUAL E5 RAG WARM-START DIAGNOSTICS]")
             print(f"- Active Index Directory:  {INDEX_DIR}")
             print(f"- Index Version Hash:      {self.index_version}")
             print(f"- FAISS Vectors Loaded:    {chunks}")
             print(f"- Metadata Entries Loaded: {chunks}")
-            print(f"- Embedding Model Loaded:  sentence-transformers/all-MiniLM-L6-v2 (CPU)")
+            print(f"- Embedding Model Loaded:  {EMBEDDING_MODEL_NAME} ({get_embedding_dimension(EMBEDDING_MODEL_NAME)}d, CPU)")
             print(f"- Embedding Model Load:    {t_emb_end - t_emb_start:.2f}s")
             print(f"- FAISS Index Load Time:   {t_faiss_end - t_faiss_start:.2f}s")
             print(f"- RAG Service Status:      READY (Total Warm-start: {self.init_time_sec:.2f}s)")
@@ -186,115 +224,501 @@ class RAGService:
             return self.db.index.ntotal
         return 0
 
-    def classify_query_intent(self, query: str) -> Dict[str, Any]:
-        """
-        Adaptive Retrieval Router:
-        Classifies query into FAST path (simple definition/FAQ) or DEEP path (complex compliance/guideline search).
-        """
-        q_clean = query.strip().lower()
-        words = q_clean.split()
+    # -------------------------------------------------------------------------
+    # 1. SCENARIO UNDERSTANDING
+    # -------------------------------------------------------------------------
+    def extract_scenario(self, question: str) -> Dict[str, Any]:
+        """Extracts structured scenario parameters from user input without inventing values."""
+        q_clean = question.strip()
+        q_lower = q_clean.lower()
         
+        # User Role Extraction
+        user_role = None
+        role_patterns = [
+            (r'\b(oil producer|producer)\b', 'producer'),
+            (r'\b(manufacturer|manufacture|manufacturing|factory owner|plant owner)\b', 'manufacturer'),
+            (r'\b(trader|distributor|seller|vendor|merchant)\b', 'trader'),
+            (r'\b(importer|importing|foreign manufacturer)\b', 'importer'),
+            (r'\b(consumer|buyer|customer)\b', 'consumer'),
+            (r'\b(jeweller|jeweler|goldsmith)\b', 'jeweller'),
+            (r'\b(testing lab|laboratory|assaying centre)\b', 'laboratory')
+        ]
+        for pattern, role in role_patterns:
+            if re.search(pattern, q_lower):
+                user_role = role
+                break
+
+        # Product Extraction
+        product = None
+        product_patterns = [
+            (r'\b(coconut oil)\b', 'coconut oil'),
+            (r'\b(edible oil|vegetable oil|mustard oil|sunflower oil)\b', 'edible oil'),
+            (r'\b(gold jewellery|gold jewelry|gold artefact|gold artifacts|hallmarked gold)\b', 'gold jewellery'),
+            (r'\b(electric kettle|kettle)\b', 'electric kettle'),
+            (r'\b(pressure cooker)\b', 'pressure cooker'),
+            (r'\b(safety helmet|helmet)\b', 'safety helmet'),
+            (r'\b(pvc pipe|pipes)\b', 'pvc pipe'),
+            (r'\b(cement)\b', 'cement'),
+            (r'\b(steel|steel product|rebar)\b', 'steel product'),
+            (r'\b(toy|toys)\b', 'toys'),
+            (r'\b(battery|batteries)\b', 'battery'),
+        ]
+        for pattern, prod in product_patterns:
+            if re.search(pattern, q_lower):
+                product = prod
+                break
+
+        if not product:
+            # Fallback regex for "company", "[X] business", "manufacture [X]"
+            m = re.search(r'\b(?:run a|own a|in the)\s+([a-z0-9\s]+?)\s+(?:company|business|factory|plant|industry)\b', q_lower)
+            if m:
+                candidate = m.group(1).strip()
+                if candidate not in {'small', 'large', 'new', 'local', 'private'}:
+                    product = candidate
+
+        # Industry Classification
+        industry = None
+        if product:
+            if 'oil' in product:
+                industry = 'oil/food product'
+            elif 'gold' in product or 'jewellery' in product:
+                industry = 'jewellery/gold'
+            elif 'kettle' in product or 'cooker' in product:
+                industry = 'household electrical appliance'
+            elif 'helmet' in product:
+                industry = 'personal protective equipment'
+            elif 'cement' in product or 'steel' in product or 'pipe' in product:
+                industry = 'construction materials'
+            else:
+                industry = 'manufactured product'
+
+        # Goal Extraction
+        goal = None
+        if re.search(r'\b(get|obtain|apply for|procedure to get|how to get)\b.*\b(certification|certificate|licence|license|bis mark|standard mark)\b', q_lower):
+            goal = 'obtain BIS certification'
+        elif re.search(r'\b(hallmarking|hallmark)\b', q_lower):
+            goal = 'hallmarking compliance'
+        elif re.search(r'\b(testing|test facility|laboratory|testing facility)\b', q_lower):
+            goal = 'product testing and conformity'
+        elif re.search(r'\b(qco|quality control order|mandatory)\b', q_lower):
+            goal = 'regulatory QCO compliance'
+        elif re.search(r'\b(what is bis|define bis|meaning of bis)\b', q_lower):
+            goal = 'understand BIS'
+
+        # Scenario Complexity Determination
+        is_scenario_words = any(w in q_lower for w in ['i am', 'we are', 'i run', 'i manufacture', 'my company', 'we produce', 'our factory', 'already have'])
+        is_procedural = any(w in q_lower for w in ['procedure', 'process', 'how to apply', 'requirements before applying', 'steps to get'])
+
+        scenario_complexity = 'high' if (is_scenario_words or (is_procedural and len(q_clean.split()) > 5)) else 'low'
+
+        return {
+            "user_role": user_role,
+            "product": product,
+            "industry": industry,
+            "goal": goal,
+            "location": None,
+            "intent": None,  # Will be set by classify_intent
+            "scenario_complexity": scenario_complexity
+        }
+
+    # -------------------------------------------------------------------------
+    # 2. INTENT CLASSIFICATION
+    # -------------------------------------------------------------------------
+    def classify_intent(self, question: str, scenario: Dict[str, Any]) -> Dict[str, Any]:
+        """Classifies intent and determines adaptive retrieval path (FAST vs DEEP)."""
+        q_clean = question.strip().lower()
+        words = q_clean.split()
+
         # Fast path triggers for concise definitional / FAQ questions
-        fast_patterns = [
+        fast_factual_patterns = [
             r'^\s*what\s+is\s+bis\??\s*$',
-            r'^\s*what\s+is\s+hallmarking\??\s*$',
             r'^\s*what\s+does\s+bis\s+stand\s+for\??\s*$',
             r'^\s*what\s+is\s+an?\s+is\s+number\??\s*$',
             r'^\s*what\s+is\s+coc\??\s*$',
             r'^\s*what\s+is\s+qco\??\s*$'
         ]
-
-        for p in fast_patterns:
+        for p in fast_factual_patterns:
             if re.search(p, q_clean):
-                return {
-                    "path": "FAST",
-                    "top_k": 3,
-                    "use_expansion": False,
-                    "early_exit_score_threshold": 0.65
-                }
+                return {"intent": "factual", "path": "FAST", "top_k": 3, "use_expansion": False}
 
         # Short definitional queries (<= 5 words starting with what/define/meaning)
-        if len(words) <= 5 and any(q_clean.startswith(prefix) for prefix in ["what is", "define", "meaning of"]):
-            return {
-                "path": "FAST",
-                "top_k": 4,
-                "use_expansion": False,
-                "early_exit_score_threshold": 0.70
-            }
+        if len(words) <= 5 and any(q_clean.startswith(prefix) for prefix in ["what is ", "define ", "meaning of "]):
+            if "hallmarking" in q_clean or "hallmark" in q_clean:
+                return {"intent": "hallmarking", "path": "FAST", "top_k": 3, "use_expansion": False}
+            return {"intent": "factual", "path": "FAST", "top_k": 4, "use_expansion": False}
 
-        # Deep path for complex compliance/procedure queries
-        return {
-            "path": "DEEP",
-            "top_k": 6,
-            "use_expansion": True,
-            "early_exit_score_threshold": 0.50
-        }
+        # Unrelated non-BIS questions
+        unrelated_keywords = ["java inheritance", "python class", "react props", "who is the president", "recipe for cake"]
+        for uk in unrelated_keywords:
+            if uk in q_clean:
+                return {"intent": "unknown", "path": "FAST", "top_k": 2, "use_expansion": False}
 
-    def expand_query(self, query: str) -> List[str]:
-        expansion_patterns = [
-            (r'\b(apply|apply for|get|obtain|how to get|procedure for)\b.*\b(certification|approval|licence|license)\b',
-             ["Grant of Licence guidelines application procedure Scheme-I", "Grant of CoC guidelines application Scheme-IV", "grant of licence to manufacturer"]),
-            (r'\b(quality control order|qco|mandatory|compulsory|is bis mandatory|is certification mandatory)\b',
-             ["Quality Control Order QCO section 16 compulsory use of Standard Mark", "compulsory certification order notified goods Scheme-I Scheme-IV"]),
-            (r'\b(certificate of conformity|coc)\b',
-             ["Certificate of Conformity CoC Scheme-IV grant of CoC conditions of CoC"]),
-            (r'\b(hallmark|hallmarking|assaying|ahc)\b',
-             ["hallmarking Assaying and Hallmarking Centre A&HC gold jewellery artefacts fineness"]),
-            (r'\b(factory surveillance|surveillance)\b',
-             ["factory surveillance surveillance inspection review of test reports licensee premises"]),
-            (r'\b(non-conformity|non conformity|failure|failure of sample)\b',
-             ["dealing with non-conformity failure of sample stop marking corrective actions"])
-        ]
-        expanded_terms = []
-        q_lower = query.lower()
-        for pattern, additions in expansion_patterns:
-            if re.search(pattern, q_lower):
-                expanded_terms.extend(additions)
-        
+        # Scenario-based / business situation questions
+        if scenario.get("scenario_complexity") == "high":
+            if re.search(r'\b(procedure|process|how to get|how to apply|apply for)\b', q_clean):
+                intent = "certification_procedure"
+            elif re.search(r'\b(testing|facility|lab|test)\b', q_clean):
+                intent = "testing_requirement"
+            elif re.search(r'\b(qco|mandatory|compulsory|order)\b', q_clean):
+                intent = "qco/regulatory"
+            elif re.search(r'\b(manufacture|factory|surveillance)\b', q_clean):
+                intent = "manufacturer_guidance"
+            else:
+                intent = "scenario_based"
+            return {"intent": intent, "path": "DEEP", "top_k": 8, "use_expansion": True}
+
+        # General intent classification for complex non-scenario queries
+        if re.search(r'\b(apply|application|procedure|process|grant of licence|get licence)\b', q_clean):
+            return {"intent": "certification_procedure", "path": "DEEP", "top_k": 6, "use_expansion": True}
+        if re.search(r'\b(qco|quality control order|mandatory|compulsory)\b', q_clean):
+            return {"intent": "qco/regulatory", "path": "DEEP", "top_k": 6, "use_expansion": True}
+        if re.search(r'\b(test|testing|lab|laboratory|sample)\b', q_clean):
+            return {"intent": "testing_requirement", "path": "DEEP", "top_k": 6, "use_expansion": True}
+        if re.search(r'\b(hallmark|hallmarking|assaying|gold)\b', q_clean):
+            return {"intent": "hallmarking", "path": "FAST", "top_k": 5, "use_expansion": False}
+        if re.search(r'\b(difference|compare|versus|vs)\b', q_clean):
+            return {"intent": "comparison", "path": "DEEP", "top_k": 6, "use_expansion": True}
+        if re.search(r'\bis\s*\d+', q_clean):
+            return {"intent": "standard_lookup", "path": "DEEP", "top_k": 5, "use_expansion": True}
+
+        return {"intent": "factual", "path": "DEEP", "top_k": 6, "use_expansion": True}
+
+    # -------------------------------------------------------------------------
+    # 3. EVIDENCE REQUIREMENT PLANNER
+    # -------------------------------------------------------------------------
+    def plan_required_categories(self, scenario: Dict[str, Any], intent_info: Dict[str, Any]) -> List[str]:
+        """Plans which evidence categories are required for the question."""
+        intent = intent_info.get("intent", "factual")
+        complexity = scenario.get("scenario_complexity", "low")
+
+        if intent in ["factual", "hallmarking"] and complexity == "low":
+            return ["certification_process"]
+
+        if intent == "qco/regulatory":
+            return ["regulatory_qco", "product_standard", "certification_process"]
+
+        if intent == "testing_requirement":
+            return ["testing", "manufacturing", "certification_process", "application"]
+
+        if intent in ["scenario_based", "certification_procedure", "manufacturer_guidance"] or complexity == "high":
+            return [
+                "product_standard",
+                "product_specific_guidance",
+                "certification_process",
+                "testing",
+                "manufacturing",
+                "regulatory_qco",
+                "application",
+                "marking"
+            ]
+
+        return ["product_standard", "certification_process"]
+
+    # -------------------------------------------------------------------------
+    # 4. QUERY DECOMPOSITION & SECOND-PASS TARGETED RETRIEVAL (MULTI-HOP)
+    # -------------------------------------------------------------------------
+    def decompose_query(self, question: str, scenario: Dict[str, Any], intent_info: Dict[str, Any]) -> List[str]:
+        """Generates first-pass subqueries for scenario/procedural queries."""
+        path = intent_info.get("path", "FAST")
+        if path == "FAST":
+            return [question]
+
+        product = scenario.get("product")
+        intent = intent_info.get("intent", "scenario_based")
+
+        queries = [question]
+
+        if product:
+            queries.extend([
+                f"What Indian Standard applies to {product}?",
+                f"What product specific BIS guidance applies to {product}?",
+                f"What is the BIS certification process for {product}?",
+                f"What manufacturing requirements apply to {product}?",
+                f"What testing and conformity requirements apply to {product}?",
+                f"What documents and application requirements apply to {product} BIS certification?",
+                f"What inspection and assessment requirements apply for {product}?",
+                f"What marking and licence requirements apply for {product}?",
+                f"Is there a Quality Control Order QCO or compulsory certification requirement for {product}?"
+            ])
+        elif intent in ["certification_procedure", "scenario_based", "manufacturer_guidance"]:
+            queries.extend([
+                "What is the BIS certification process and grant of licence guidelines?",
+                "What factory testing facility and laboratory requirements apply before applying for BIS licence?",
+                "What manufacturing capability and quality control requirements apply?",
+                "What document and application requirements are needed for BIS licence?",
+                "What factory inspection and assessment steps apply during BIS audit?",
+                "What marking and licence conditions apply for certified products?",
+                "Quality Control Order QCO section 16 compulsory use of Standard Mark"
+            ])
+        elif intent == "testing_requirement":
+            queries.extend([
+                "What testing facilities and equipment are required for BIS certification?",
+                "What factory laboratory testing requirements apply for licensee?",
+                "What sample testing and non conformity procedures apply?"
+            ])
+        elif intent == "qco/regulatory":
+            queries.extend([
+                "Quality Control Order QCO section 16 compulsory use of Standard Mark",
+                "compulsory certification order notified goods Scheme-I Scheme-IV"
+            ])
+
         seen = set()
         deduped = []
-        for term in expanded_terms:
-            if term not in seen:
-                seen.add(term)
-                deduped.append(term)
+        for q in queries:
+            q_norm = q.lower().strip()
+            if q_norm not in seen:
+                seen.add(q_norm)
+                deduped.append(q)
+
         return deduped
 
-    def retrieve_hybrid_documents(self, query: str, route: Dict[str, Any]):
+    def extract_entities_from_docs(self, docs_with_scores: List[Tuple[Any, float]], scenario: Dict[str, Any]) -> List[str]:
+        """Extracts key entities (IS numbers, schemes, products) for multi-hop second pass."""
+        entities = []
+        if scenario.get("product"):
+            entities.append(scenario["product"])
+
+        for doc, _ in docs_with_scores:
+            is_num = doc.metadata.get("is_number")
+            if is_num and is_num not in entities:
+                entities.append(is_num)
+
+            # Regex extract IS numbers from chunk text
+            text_is = re.findall(r'\bIS\s*[:/-]?\s*\d+(?:\s*\(Part\s*\d+\))?(?::\s*\d{4})?\b', doc.page_content, re.IGNORECASE)
+            for m in text_is[:2]:
+                clean_m = re.sub(r'\s+', ' ', m).upper()
+                if clean_m not in entities:
+                    entities.append(clean_m)
+
+        return entities
+
+    def generate_second_pass_queries(self, missing_categories: List[str], scenario: Dict[str, Any], entities: List[str]) -> List[str]:
+        """Generates targeted second-pass queries specifically for missing evidence categories."""
+        product = scenario.get("product") or ""
+        is_entities = [e for e in entities if e.startswith("IS")]
+        subject = is_entities[0] if is_entities else (product if product else "BIS certification")
+
+        second_pass_queries = []
+
+        cat_templates = {
+            "product_standard": [
+                f"What Indian Standard IS applies to {subject}?",
+                f"Indian Standard specification requirement for {subject}"
+            ],
+            "product_specific_guidance": [
+                f"{subject} product manual guidelines BIS licence",
+                f"product specific guidance guidelines for {subject}"
+            ],
+            "certification_process": [
+                f"{subject} BIS certification process grant of licence guidelines",
+                f"Grant of Licence procedure for {subject} Scheme-I Scheme-IV"
+            ],
+            "testing": [
+                f"{subject} testing facilities factory laboratory requirements",
+                f"sample testing conformity assessment requirements for {subject}"
+            ],
+            "manufacturing": [
+                f"{subject} factory manufacturing quality control requirements",
+                f"manufacturing plant inspection raw material requirements for {subject}"
+            ],
+            "regulatory_qco": [
+                f"{subject} Quality Control Order QCO compulsory certification",
+                f"is BIS certification mandatory QCO section 16 for {subject}"
+            ],
+            "application": [
+                f"{subject} application form documentation fees requirements BIS licence",
+                f"how to apply for BIS licence application submission Form-V for {subject}"
+            ],
+            "marking": [
+                f"{subject} Standard Mark marking requirements licence conditions",
+                f"labelling and marking requirements for {subject}"
+            ]
+        }
+
+        for cat in missing_categories:
+            if cat in cat_templates:
+                second_pass_queries.extend(cat_templates[cat])
+
+        seen = set()
+        deduped = []
+        for q in second_pass_queries:
+            qn = q.lower().strip()
+            if qn not in seen:
+                seen.add(qn)
+                deduped.append(q)
+
+        return deduped
+
+    def retrieve_multi_query_documents(self, queries: List[str], route: Dict[str, Any]) -> List[Tuple[Any, float]]:
         if not self.is_ready():
             raise RuntimeError(self._init_error or "RAG Service is not initialized.")
 
-        top_k = route.get("top_k", 6)
-        use_expansion = route.get("use_expansion", False)
+        top_k = route.get("top_k", 8)
 
-        # Retrieval Cache check
-        ret_cache_key = f"{query}_{self.index_version}_{top_k}_{use_expansion}"
-        cached_retrieval = self.retrieval_cache.get(ret_cache_key)
-        if cached_retrieval:
-            return cached_retrieval
+        all_results = []
+        top_per_query = 3 if len(queries) > 1 else top_k
 
-        # Primary vector search
-        results = self.db.similarity_search_with_score(query, k=top_k)
+        for q in queries:
+            res = self.db.similarity_search_with_score(q, k=top_per_query)
+            all_results.extend(res)
 
-        # Conditional query expansion search
-        if use_expansion:
-            extra_phrases = self.expand_query(query)
-            for phrase in extra_phrases[:2]:
-                extra_results = self.db.similarity_search_with_score(phrase, k=3)
-                results.extend(extra_results)
-
-        # Efficient deduplication by content hash
+        # Deduplicate by content MD5 hash, retaining best L2 score
         unique_chunks = {}
-        for doc, score in results:
+        for doc, score in all_results:
             content_hash = hashlib.md5(doc.page_content.strip().encode('utf-8')).hexdigest()
             if content_hash not in unique_chunks or score < unique_chunks[content_hash][1]:
                 unique_chunks[content_hash] = (doc, score)
 
         sorted_chunks = sorted(unique_chunks.values(), key=lambda x: x[1])
-        final_candidates = sorted_chunks[:top_k]
+        return sorted_chunks[:top_k]
 
-        self.retrieval_cache.put(ret_cache_key, final_candidates)
-        return final_candidates
+    # -------------------------------------------------------------------------
+    # 5. EVIDENCE GROUPING & COVERAGE
+    # -------------------------------------------------------------------------
+    def group_evidence(self, hybrid_docs: List[Tuple[Any, float]]) -> Dict[str, List[Dict[str, Any]]]:
+        categories = {
+            "product_standard": [],
+            "product_specific_guidance": [],
+            "certification_process": [],
+            "testing": [],
+            "manufacturing": [],
+            "regulatory_qco": [],
+            "application": [],
+            "marking": [],
+            "other": []
+        }
 
+        for doc, score in hybrid_docs:
+            src_doc = doc.metadata.get("source_document", "BIS Document")
+            doc_title = doc.metadata.get("document_title", src_doc)
+            page_num = doc.metadata.get("page_number", "N/A")
+            cat_meta = doc.metadata.get("category", "general")
+            is_num = doc.metadata.get("is_number", "")
+            clause_num = doc.metadata.get("clause_number", "")
+            sec_num = doc.metadata.get("section_number", "")
+            scheme_num = doc.metadata.get("scheme_number", "")
+            qco_ref = doc.metadata.get("qco_reference", "")
+            content_lower = doc.page_content.lower()
+            fn_lower = src_doc.lower()
+
+            item = {
+                "source_document": src_doc,
+                "document_title": doc_title,
+                "page_number": page_num,
+                "category_meta": cat_meta,
+                "is_number": is_num,
+                "clause_number": clause_num,
+                "section_number": sec_num,
+                "scheme_number": scheme_num,
+                "qco_reference": qco_ref,
+                "relevance_score": round(float(score), 4),
+                "content": doc.page_content
+            }
+
+            assigned_cat = "other"
+            if is_num or "bs_" in fn_lower or "indian standard" in content_lower or cat_meta == "standards":
+                assigned_cat = "product_standard"
+            elif qco_ref or "quality control order" in content_lower or "qco" in content_lower or "section 16" in content_lower or cat_meta == "regulations":
+                assigned_cat = "regulatory_qco"
+            elif "guideline" in fn_lower or "guidelines" in content_lower or "product manual" in content_lower:
+                assigned_cat = "product_specific_guidance"
+            elif "test" in content_lower or "laboratory" in content_lower or "assaying" in content_lower or cat_meta == "laboratories":
+                assigned_cat = "testing"
+            elif "manufactur" in content_lower or "factory" in content_lower or "surveillance" in content_lower or "raw material" in content_lower:
+                assigned_cat = "manufacturing"
+            elif "application" in content_lower or "form" in content_lower or "fee" in content_lower or "document" in content_lower:
+                assigned_cat = "application"
+            elif "mark" in content_lower or "standard mark" in content_lower or "licence" in content_lower or cat_meta == "certification":
+                assigned_cat = "certification_process"
+            elif "marking" in content_lower or "label" in content_lower:
+                assigned_cat = "marking"
+
+            categories[assigned_cat].append(item)
+
+        return categories
+
+    def validate_evidence(self, grouped_evidence: Dict[str, List[Dict[str, Any]]], required_categories: List[str]) -> Dict[str, Any]:
+        validation_status = {}
+        summary_lines = []
+
+        category_labels = {
+            "product_standard": "PRODUCT STANDARD",
+            "product_specific_guidance": "PRODUCT SPECIFIC GUIDANCE",
+            "certification_process": "CERTIFICATION PROCESS",
+            "testing": "TESTING & CONFORMITY",
+            "manufacturing": "MANUFACTURING REQUIREMENTS",
+            "regulatory_qco": "REGULATORY / QCO STATUS",
+            "application": "APPLICATION REQUIREMENTS",
+            "marking": "MARKING & LICENCE"
+        }
+
+        for cat_key in required_categories:
+            cat_name = category_labels.get(cat_key, cat_key.upper())
+            count = len(grouped_evidence.get(cat_key, []))
+            if count > 0:
+                validation_status[cat_key] = True
+                summary_lines.append(f"{cat_name}: Evidence found ✓ ({count} chunk(s))")
+            else:
+                validation_status[cat_key] = False
+                summary_lines.append(f"{cat_name}: Evidence insufficient ⚠ (Needs verification)")
+
+        return {
+            "status_map": validation_status,
+            "summary_text": "\n".join(summary_lines)
+        }
+
+    # -------------------------------------------------------------------------
+    # 6. CLAIM VALIDATION LAYER
+    # -------------------------------------------------------------------------
+    def validate_claims(self, grouped_evidence: Dict[str, List[Dict[str, Any]]], scenario: Dict[str, Any]) -> Dict[str, Any]:
+        """Creates internal claim-to-evidence mappings for regulatory and standard claims."""
+        claims = {}
+
+        # 1. Product Standard Claim
+        std_items = grouped_evidence.get("product_standard", [])
+        if std_items:
+            found_is = [item["is_number"] for item in std_items if item.get("is_number")]
+            claims["product_standard"] = {
+                "status": "SUPPORTED",
+                "details": f"Indian Standard identified: {', '.join(found_is)}" if found_is else "Indian Standard specification text present"
+            }
+        else:
+            claims["product_standard"] = {
+                "status": "NOT ESTABLISHED",
+                "details": f"Specific Indian Standard for {scenario.get('product') or 'product'} not found in indexed documents"
+            }
+
+        # 2. Regulatory QCO Mandatory Claim
+        qco_items = grouped_evidence.get("regulatory_qco", [])
+        if qco_items:
+            claims["regulatory_qco"] = {
+                "status": "SUPPORTED",
+                "details": "Quality Control Order (QCO) regulatory evidence present in retrieved documents"
+            }
+        else:
+            claims["regulatory_qco"] = {
+                "status": "NOT ESTABLISHED",
+                "details": "Mandatory QCO status could not be established from available indexed evidence. Must be verified against latest official regulatory sources."
+            }
+
+        # 3. Testing & Conformity Claim
+        test_items = grouped_evidence.get("testing", [])
+        if test_items:
+            claims["testing"] = {
+                "status": "SUPPORTED",
+                "details": "Testing facility / laboratory requirements evidence present"
+            }
+        else:
+            claims["testing"] = {
+                "status": "NOT ESTABLISHED",
+                "details": "Specific laboratory testing parameters not detailed in retrieved chunks"
+            }
+
+        return claims
+
+    # -------------------------------------------------------------------------
+    # LLM CALL HELPERS
+    # -------------------------------------------------------------------------
     def _generate_gemini_content(self, prompt: str) -> str:
         last_error = None
         models = get_text_models()
@@ -311,7 +735,6 @@ class RAGService:
                 err_str = str(e)
                 print(f"[RAG_WARN] Gemini API call failed for '{model_name}': {err_str[:120]}")
                 last_error = e
-                # On 429 Rate Limit / Quota Exceeded, immediately switch to next model without waiting!
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
                     continue
                 elif "404" not in err_str and "NOT_FOUND" not in err_str:
@@ -319,7 +742,6 @@ class RAGService:
                 continue
 
         raise RuntimeError(f"Gemini API request failed across models: {str(last_error)}")
-
 
     def get_text_model(self) -> str:
         return os.getenv("GEMINI_TEXT_MODEL", DEFAULT_TEXT_MODEL).strip()
@@ -331,9 +753,10 @@ class RAGService:
         api_key = os.getenv("GEMINI_API_KEY")
         return "configured" if api_key and api_key.strip() else "not_configured"
 
-
     def calculate_confidence(self, best_score: float, answer_text: str) -> str:
-        if "sorry" in answer_text.lower() and "couldn't find" in answer_text.lower():
+        ans_lower = answer_text.lower()
+        refusal_phrases = ["sorry", "couldn't find", "no mention", "no information", "not referenced", "does not contain any information", "not found in"]
+        if any(p in ans_lower for p in refusal_phrases):
             return "Limited Evidence"
         elif best_score < 0.75:
             return "High Confidence"
@@ -369,7 +792,6 @@ class RAGService:
         return "English"
 
     def normalize_query_for_retrieval(self, query: str) -> str:
-        # Only translate if query contains non-Latin multilingual scripts (e.g. Tamil or Hindi)
         if any('\u0b80' <= c <= '\u0bff' or '\u0900' <= c <= '\u097f' for c in query):
             norm_prompt = f"Translate/normalize the following user query into concise English technical search terms for vector database lookup of Indian Standards: '{query}'. Return ONLY the English search terms with no extra commentary."
             try:
@@ -379,7 +801,9 @@ class RAGService:
                 return query
         return query
 
-
+    # -------------------------------------------------------------------------
+    # MAIN SCENARIO-AWARE 2-PASS RAG PIPELINE
+    # -------------------------------------------------------------------------
     def process_query(self, question: str, response_language: str = None) -> Dict[str, Any]:
         t_req_start = time.time()
         self.total_queries += 1
@@ -392,9 +816,8 @@ class RAGService:
         target_lang = self.normalize_response_language(response_language, question)
         clean_q = question.strip()
 
-        # SAFE SEMANTIC ANSWER CACHE CHECK (Case-insensitive)
+        # Cache check
         cache_key = f"{clean_q.lower()}_{target_lang}_{self.index_version}"
-
         cached_result = self.answer_cache.get(cache_key)
         if cached_result:
             self.cache_hits += 1
@@ -407,36 +830,80 @@ class RAGService:
             res_copy["timings"] = {
                 "init_check_sec": round(t_init_check, 4),
                 "query_norm_sec": 0.0,
-                "retrieval_sec": 0.0,
-                "rerank_sec": 0.0,
-                "gemini_sec": 0.0,
-                "total_sec": round(t_total, 4),
+                "first_pass_time_sec": 0.0,
+                "second_pass_time_sec": 0.0,
+                "total_retrieval_time_sec": 0.0,
+                "generation_time_sec": 0.0,
+                "total_time_sec": round(t_total, 4),
                 "cache_hit": True
             }
             print(f"[PURIVU CACHE HIT] Query: '{clean_q}' | Served in {t_total:.4f}s")
             return res_copy
 
-        # ADAPTIVE ROUTER CLASSIFICATION
-        route = self.classify_query_intent(clean_q)
+        # Stage 1: Scenario Understanding
+        scenario = self.extract_scenario(clean_q)
+
+        # Stage 2: Intent Classification & Route Determination
+        intent_info = self.classify_intent(clean_q, scenario)
+        scenario["intent"] = intent_info["intent"]
+        route = intent_info
+
         self.path_counts[route["path"]] = self.path_counts.get(route["path"], 0) + 1
 
-        # QUERY NORMALIZATION
+        # Stage 3: Evidence Requirement Planning
+        required_categories = self.plan_required_categories(scenario, route)
+
+        # Stage 4: First-Pass Multi-Query Retrieval
         t_norm_start = time.time()
         retrieval_query = self.normalize_query_for_retrieval(clean_q)
+        subqueries_pass1 = self.decompose_query(retrieval_query, scenario, route)
         t_norm = time.time() - t_norm_start
 
-        # FAISS RETRIEVAL
-        t_retrieval_start = time.time()
-        hybrid_docs = self.retrieve_hybrid_documents(retrieval_query, route)
-        t_retrieval = time.time() - t_retrieval_start
+        t_pass1_start = time.time()
+        docs_pass1 = self.retrieve_multi_query_documents(subqueries_pass1, route)
+        t_pass1 = time.time() - t_pass1_start
+
+        # Calculate First-Pass Coverage
+        grouped_pass1 = self.group_evidence(docs_pass1)
+        found_pass1 = [c for c in required_categories if len(grouped_pass1.get(c, [])) > 0]
+        missing_pass1 = [c for c in required_categories if c not in found_pass1]
+
+        # Stage 5: Targeted Second-Pass Retrieval (Multi-Hop) if missing categories exist
+        docs_final = list(docs_pass1)
+        subqueries_pass2 = []
+        t_pass2 = 0.0
+
+        if missing_pass1 and route["path"] == "DEEP":
+            t_pass2_start = time.time()
+            entities = self.extract_entities_from_docs(docs_pass1, scenario)
+            subqueries_pass2 = self.generate_second_pass_queries(missing_pass1, scenario, entities)
+
+            if subqueries_pass2:
+                docs_pass2 = self.retrieve_multi_query_documents(subqueries_pass2, route)
+
+                # Merge & deduplicate Pass 1 + Pass 2 documents by content MD5 hash
+                combined_dict = {}
+                for doc, score in docs_pass1 + docs_pass2:
+                    chash = hashlib.md5(doc.page_content.strip().encode('utf-8')).hexdigest()
+                    if chash not in combined_dict or score < combined_dict[chash][1]:
+                        combined_dict[chash] = (doc, score)
+
+                sorted_combined = sorted(combined_dict.values(), key=lambda x: x[1])
+                # Expand max capacity slightly for 2-pass deep retrieval
+                docs_final = sorted_combined[:route.get("top_k", 8) + 3]
+                t_pass2 = time.time() - t_pass2_start
+
+        t_retrieval = t_pass1 + t_pass2
         self.retrieval_times.append(t_retrieval)
 
-        if not hybrid_docs:
-            refusal = "Sorry, I couldn't find that information in the provided BIS documents."
+        # Exit check for unknown queries or empty retrieval
+        if intent_info["intent"] == "unknown" or not docs_final:
+            refusal = "Sorry, I couldn't find relevant Indian Standards or official BIS evidence for your question."
             if target_lang == "Tamil":
                 refusal = "மன்னித்துக்கொள்ளுங்கள், வழங்கப்பட்ட BIS ஆவணங்களில் இந்தத் தகவல் கிடைக்கவில்லை. தவறான BIS தரநிலை அல்லது certification requirement-ஐ உருவாக்காமல் இருக்க, நான் இதை உறுதிப்படுத்தப்பட்ட தகவலாகக் கூறவில்லை."
             elif target_lang == "Hindi":
                 refusal = "क्षमा करें, दिए गए BIS दस्तावेजों में यह जानकारी नहीं मिल सकी। किसी गलत जानकारी से बचने के लिए, केवल आधिकारिक दस्तावेजों के आधार पर ही उत्तर दिया जाता है।"
+            
             t_total = time.time() - t_req_start
             self.latencies.append(t_total)
             return {
@@ -446,123 +913,196 @@ class RAGService:
                 "response_language": target_lang,
                 "execution_time_seconds": round(t_total, 3),
                 "timings": {
-                    "init_check_sec": round(t_init_check, 4),
-                    "query_norm_sec": round(t_norm, 4),
-                    "retrieval_sec": round(t_retrieval, 4),
-                    "gemini_sec": 0.0,
-                    "total_sec": round(t_total, 4)
+                    "intent": intent_info["intent"],
+                    "scenario_complexity": scenario["scenario_complexity"],
+                    "retrieval_path": route["path"],
+                    "first_pass_time_sec": round(t_pass1, 4),
+                    "second_pass_time_sec": round(t_pass2, 4),
+                    "required_categories": required_categories,
+                    "found_categories": [],
+                    "missing_categories": required_categories,
+                    "evidence_coverage": f"0 of {len(required_categories)} required evidence areas found",
+                    "total_retrieved": 0,
+                    "final_evidence_count": 0,
+                    "total_retrieval_time_sec": round(t_retrieval, 4),
+                    "generation_time_sec": 0.0,
+                    "total_time_sec": round(t_total, 4)
                 }
             }
 
-        # RERANKING & CONTEXT BUILD
+        # Stage 6: Final Evidence Grouping & Validation
         t_rerank_start = time.time()
-        best_l2_score = hybrid_docs[0][1]
+        best_l2_score = docs_final[0][1]
 
-        context_chunks = []
-        sources_list = []
-        seen_sources = set()
+        grouped_evidence = self.group_evidence(docs_final)
+        found_final = [c for c in required_categories if len(grouped_evidence.get(c, [])) > 0]
+        missing_final = [c for c in required_categories if c not in found_final]
 
-        for i, (doc, score) in enumerate(hybrid_docs):
-            src_doc = doc.metadata.get("source_document", "BIS Document")
-            doc_title = doc.metadata.get("document_title", src_doc)
-            page_num = doc.metadata.get("page_number", "N/A")
-            cat = doc.metadata.get("category", "general")
-            is_num = doc.metadata.get("is_number", "")
-            clause_num = doc.metadata.get("clause_number", "")
-            sec_num = doc.metadata.get("section_number", "")
-            scheme_num = doc.metadata.get("scheme_number", "")
-            qco_ref = doc.metadata.get("qco_reference", "")
+        coverage_str = f"{len(found_final)} of {len(required_categories)} required evidence areas found"
 
-            meta_str = f"Document: {doc_title} ({src_doc}) | Category: {cat} | Page: {page_num}"
-            if is_num: meta_str += f" | IS: {is_num}"
-            if clause_num: meta_str += f" | Clause: {clause_num}"
-            if sec_num: meta_str += f" | Section: {sec_num}"
-            if scheme_num: meta_str += f" | Scheme: {scheme_num}"
-            if qco_ref: meta_str += f" | QCO Ref: {qco_ref}"
+        evidence_val = self.validate_evidence(grouped_evidence, required_categories)
 
-            context_chunks.append(
-                f"SOURCE {i+1}\n"
-                f"{meta_str}\n"
-                f"Relevant Text:\n{doc.page_content}"
-            )
-
-            src_key = f"{src_doc}_p{page_num}"
-            if src_key not in seen_sources:
-                seen_sources.add(src_key)
-                src_item = {
-                    "document": src_doc,
-                    "document_title": doc_title if doc_title != src_doc else None,
-                    "page": page_num,
-                    "category": cat if cat != "general" else None,
-                    "is_number": is_num if is_num else None,
-                    "clause_number": clause_num if clause_num else None,
-                    "section_number": sec_num if sec_num else None,
-                    "scheme_number": scheme_num if scheme_num else None,
-                    "qco_reference": qco_ref if qco_ref else None,
-                    "relevance_score": round(float(score), 4)
-                }
-                sources_list.append(src_item)
-
-        context_text = "\n\n".join(context_chunks)
+        # Stage 7: Claim Validation Layer
+        claims_val = self.validate_claims(grouped_evidence, scenario)
         t_rerank = time.time() - t_rerank_start
 
-        # GEMINI GENERATION
+        # Source Citation Construction
+        sources_list = []
+        seen_sources = set()
+        context_chunks = []
+
+        idx = 1
+        for cat_name, cat_items in grouped_evidence.items():
+            for item in cat_items:
+                src_doc = item["source_document"]
+                doc_title = item["document_title"]
+                page_num = item["page_number"]
+
+                meta_str = f"Document: {doc_title} ({src_doc}) | Category: {cat_name} | Page: {page_num}"
+                if item["is_number"]: meta_str += f" | IS: {item['is_number']}"
+                if item["clause_number"]: meta_str += f" | Clause: {item['clause_number']}"
+                if item["section_number"]: meta_str += f" | Section: {item['section_number']}"
+
+                context_chunks.append(f"SOURCE {idx} [{cat_name.upper()}]\n{meta_str}\nRelevant Text:\n{item['content']}")
+                idx += 1
+
+                src_key = f"{src_doc}_p{page_num}"
+                if src_key not in seen_sources:
+                    seen_sources.add(src_key)
+                    sources_list.append({
+                        "document": src_doc,
+                        "document_title": doc_title if doc_title != src_doc else None,
+                        "page": page_num,
+                        "category": cat_name if cat_name != "other" else None,
+                        "is_number": item["is_number"] if item["is_number"] else None,
+                        "clause_number": item["clause_number"] if item["clause_number"] else None,
+                        "section_number": item["section_number"] if item["section_number"] else None,
+                        "scheme_number": item["scheme_number"] if item["scheme_number"] else None,
+                        "qco_reference": item["qco_reference"] if item["qco_reference"] else None,
+                        "relevance_score": item["relevance_score"]
+                    })
+
+        context_text = "\n\n".join(context_chunks)
+
+        # Stage 8: Grounded Answer Generation with Dynamic Answer Structure
         t_gemini_start = time.time()
+
         if target_lang == "Tamil":
             lang_directive = (
                 "CRITICAL MANDATORY LANGUAGE INSTRUCTION:\n"
                 "You MUST write your ENTIRE explanation and markdown section headers in TAMIL (தமிழ்).\n"
-                "Do NOT write in English. Do NOT switch to English because the Context text is in English.\n"
-                "Write natural, fluent, professional Tamil for all explanations.\n\n"
-                "TECHNICAL IDENTIFIER RULE (MUST REMAIN IN ENGLISH):\n"
-                "Keep ONLY the following technical identifiers in original English script:\n"
-                "• BIS\n"
-                "• IS numbers (e.g., IS 15820, IS 12312)\n"
-                "• QCO (Quality Control Order)\n"
-                "• CoC (Certificate of Conformity)\n"
-                "• Scheme-I, Scheme-IV, Scheme numbers\n"
-                "• Clause numbers (e.g. Clause 5.1)\n"
-                "• Section numbers (e.g. Section 16)\n"
-                "• Document names and citations\n"
-                "Do NOT translate standard numbers or IS references into Tamil script."
+                "Keep standard BIS identifiers (BIS, IS numbers, QCO, CoC, Scheme-I, Clause numbers) in original English script."
             )
         elif target_lang == "Hindi":
             lang_directive = (
                 "CRITICAL MANDATORY LANGUAGE INSTRUCTION:\n"
                 "You MUST write your ENTIRE explanation and markdown section headers in HINDI (हिन्दी).\n"
-                "Do NOT write in English. Do NOT switch to English because the Context text is in English.\n"
-                "Write natural, fluent, professional Hindi for all explanations.\n\n"
-                "TECHNICAL IDENTIFIER RULE (MUST REMAIN IN ENGLISH):\n"
-                "Keep ONLY BIS technical identifiers (BIS, IS 15820, QCO, CoC, Scheme-I, Scheme-IV, Clause numbers, Section numbers) in original English script."
+                "Keep standard BIS identifiers (BIS, IS numbers, QCO, CoC, Scheme-I, Clause numbers) in original English script."
             )
         else:
-            lang_directive = (
-                "CRITICAL MANDATORY LANGUAGE INSTRUCTION:\n"
-                "You MUST write your entire response in English."
-            )
+            lang_directive = "You MUST write your entire response in English."
 
-        prompt = f"""
+        # Format Claim Validation Summary
+        claims_summary_str = "\n".join([f"- {k.upper()}: Status={v['status']} | Details={v['details']}" for k, v in claims_val.items()])
+
+        # Dynamic Layout Selection based on Intent & Complexity
+        if route["path"] == "DEEP" or scenario["scenario_complexity"] == "high":
+            prompt = f"""
 You are PURIVU (BIS Saathi), an AI-powered Intelligent Assistant for Indian Standards and Bureau of Indian Standards (BIS) services.
 
 {lang_directive}
 
+USER SCENARIO CONTEXT:
+- Role: {scenario.get('user_role') or 'Not specified'}
+- Product: {scenario.get('product') or 'Not specified'}
+- Industry: {scenario.get('industry') or 'Not specified'}
+- Goal: {scenario.get('goal') or 'Not specified'}
+- Intent: {intent_info['intent']}
+
+INTERNAL EVIDENCE COVERAGE SUMMARY ({coverage_str}):
+{evidence_val['summary_text']}
+
+INTERNAL CLAIM VALIDATION STATUS:
+{claims_summary_str}
+
+CRITICAL GROUNDING & REGULATORY RULES:
+1. Answer strictly using ONLY the provided Context chunks below.
+2. IMPORTANT REGULATORY RULE: An Indian Standard existing DOES NOT mean BIS certification is legally mandatory. Certification is only mandatory if a Quality Control Order (QCO) explicitly mandates it in retrieved evidence. If mandatory QCO status is NOT ESTABLISHED in retrieved text, state explicitly: "Mandatory status could not be established from the available indexed BIS evidence and should be verified against the latest official regulatory source."
+3. DO NOT invent IS numbers, clause numbers, testing requirements, fees, or laboratories.
+4. SUPPORTED claims may be presented as established facts. NOT ESTABLISHED claims MUST NOT be presented as facts; mark them explicitly as "Needs verification".
+5. Structure your response into clean markdown section headers in {target_lang}:
+
+### 1. Understanding Your Situation
+[Brief, practical summary of user's role, product, and certification objective in {target_lang}]
+
+### 2. Applicable Indian Standard
+[Specify exact Indian Standard (IS) number(s) from retrieved evidence. If NOT ESTABLISHED, write "Needs verification: Specific IS number for this product was not found in retrieved documents."]
+
+### 3. Regulatory & Mandate Status (Mandatory vs Voluntary)
+[State whether certification appears mandatory or voluntary based ONLY on QCO evidence in retrieved documents. Do NOT make unbacked legal claims.]
+
+### 4. Certification Pathway
+[Explain Scheme-I (Grant of Licence) or Scheme-IV (Certificate of Conformity) as established in retrieved evidence.]
+
+### 5. Manufacturing Preparation
+[Detail factory quality control, testing equipment, raw material verification from retrieved evidence. Mark missing items as 'Needs verification'.]
+
+### 6. Testing & Conformity Requirements
+[Detail sample testing and factory lab requirements from retrieved evidence. DO NOT invent laboratories.]
+
+### 7. Application & Assessment Steps
+[Step-by-step submission, documentation, and factory audit steps from retrieved evidence.]
+
+### 8. Marking & Licensing Requirements
+[Standard Mark application, licence conditions.]
+
+### 9. Items to Verify / Evidence Gaps
+[Explicitly list all items marked as 'Needs verification' or NOT ESTABLISHED.]
+
+### 10. Recommended Next Actions & Clarifications
+[Clear next steps. Include 2-3 targeted clarification questions if key scenario details are missing.]
+
+### 11. Official Sources
+[Brief citation summary referencing the cited BIS source documents.]
+
+*(LEGAL CAVEAT: State that official certification decisions are issued exclusively by the Bureau of Indian Standards (BIS).)*
+
+Context Chunks:
+{context_text}
+
+Original Question:
+{question}
+
+Final Structured Answer (in {target_lang}):
+"""
+        elif intent_info["intent"] in ["certification_procedure", "standard_lookup"]:
+            prompt = f"""
+You are PURIVU (BIS Saathi), an AI-powered Intelligent Assistant for Indian Standards and Bureau of Indian Standards (BIS) services.
+
+{lang_directive}
+
+INTERNAL CLAIM VALIDATION STATUS:
+{claims_summary_str}
+
 CRITICAL GROUNDING RULES:
-1. Answer ONLY using the facts explicitly present in the provided Context below.
-2. DO NOT hallucinate or invent any Indian Standard (IS) numbers, clause numbers, certification requirements, testing procedures, fees, or legal mandates not stated in the Context.
-3. Clearly distinguish between distinct concepts (BIS Certification vs Licence vs CoC vs QCO).
-4. If the provided Context does NOT contain enough information to answer the question accurately, respond strictly with refusal text in {target_lang}.
-5. Format your response into clean markdown sections in {target_lang}:
-   ### Answer
-   [Clear, direct explanation in {target_lang}]
+1. Answer strictly using ONLY the provided Context below.
+2. DO NOT hallucinate standard numbers, clauses, or legal requirements.
+3. Structure response into clean markdown section headers in {target_lang}:
 
-   ### Key Points
-   • [Point 1 in {target_lang}]
-   • [Point 2 in {target_lang}]
+### Applicable Standard & Overview
+[Summary of standard or service]
 
-   ### What You May Need to Do
-   1. [Step 1 in {target_lang}]
-   2. [Step 2 in {target_lang}]
-   *(NOTE: Omit 'What You May Need to Do' if evidence does not provide actionable steps.)*
+### Certification Procedure
+[Step-by-step process based on evidence]
+
+### Key Requirements
+[Manufacturing, testing, or documentation requirements]
+
+### Recommended Next Actions
+[Clear actionable steps]
+
+### Official Sources
+[Citations]
 
 Context:
 {context_text}
@@ -570,7 +1110,33 @@ Context:
 Question:
 {question}
 
-Final Answer (MUST BE IN {target_lang}):
+Final Answer (in {target_lang}):
+"""
+        else:
+            # Simple Factual Layout
+            prompt = f"""
+You are PURIVU (BIS Saathi), an AI-powered Intelligent Assistant for Indian Standards and Bureau of Indian Standards (BIS) services.
+
+{lang_directive}
+
+CRITICAL GROUNDING RULES:
+1. Answer strictly using ONLY the provided Context below.
+2. DO NOT hallucinate standard numbers, clauses, or legal requirements.
+3. Format response in clean markdown:
+   ### Answer
+   [Clear, direct explanation]
+
+   ### Key Points
+   • [Point 1]
+   • [Point 2]
+
+Context:
+{context_text}
+
+Question:
+{question}
+
+Final Answer (in {target_lang}):
 """
 
         answer_text = self._generate_gemini_content(prompt)
@@ -578,31 +1144,49 @@ Final Answer (MUST BE IN {target_lang}):
         self.gemini_times.append(t_gemini)
 
         confidence_level = self.calculate_confidence(best_l2_score, answer_text)
-        if "sorry" in answer_text.lower() and "couldn't find" in answer_text.lower():
-            confidence_level = "Limited Evidence"
 
         t_total = time.time() - t_req_start
         self.latencies.append(t_total)
 
         timing_breakdown = {
+            "intent": intent_info["intent"],
+            "scenario_complexity": scenario["scenario_complexity"],
+            "retrieval_path": route["path"],
+            "first_pass_subqueries": subqueries_pass1,
+            "second_pass_subqueries": subqueries_pass2,
+            "first_pass_time_sec": round(t_pass1, 4),
+            "second_pass_time_sec": round(t_pass2, 4),
+            "required_categories": required_categories,
+            "found_categories": found_final,
+            "missing_categories": missing_final,
+            "evidence_coverage": coverage_str,
+            "total_retrieved": len(docs_pass1) + len(subqueries_pass2),
+            "final_evidence_count": len(docs_final),
+            "total_retrieval_time_sec": round(t_retrieval, 4),
+            "generation_time_sec": round(t_gemini, 4),
+            "total_time_sec": round(t_total, 4),
             "init_check_sec": round(t_init_check, 4),
             "query_norm_sec": round(t_norm, 4),
-            "retrieval_sec": round(t_retrieval, 4),
             "rerank_sec": round(t_rerank, 4),
-            "gemini_sec": round(t_gemini, 4),
-            "total_sec": round(t_total, 4),
-            "path": route["path"]
+            "cache_hit": False
         }
 
+        # Stage 10 Requirement: Print Debug Diagnostic Summary
         print("\n" + "=" * 60)
-        print(f"[PURIVU RAG TIMING DIAGNOSTICS]")
-        print(f"Query: \"{question}\" (Path: {route['path']})")
-        print(f"- RAG Initialization check: {timing_breakdown['init_check_sec']:.4f}s")
-        print(f"- Query Normalization:       {timing_breakdown['query_norm_sec']:.4f}s")
-        print(f"- FAISS Retrieval:           {timing_breakdown['retrieval_sec']:.4f}s")
-        print(f"- Reranking & Context Build: {timing_breakdown['rerank_sec']:.4f}s")
-        print(f"- Gemini API Generation:     {timing_breakdown['gemini_sec']:.4f}s")
-        print(f"- Total Request Time:        {timing_breakdown['total_sec']:.4f}s")
+        print(f"[PURIVU SCENARIO RAG 2-PASS DIAGNOSTICS]")
+        print(f"Query: \"{question}\"")
+        print(f"- Intent:                       {intent_info['intent']}")
+        print(f"- Scenario Complexity:         {scenario['scenario_complexity']}")
+        print(f"- Retrieval Path:               {route['path']}")
+        print(f"- Pass 1 Time:                  {t_pass1:.4f}s ({len(subqueries_pass1)} subqueries)")
+        print(f"- Pass 2 Time:                  {t_pass2:.4f}s ({len(subqueries_pass2)} targeted subqueries)")
+        print(f"- Evidence Coverage:            {coverage_str}")
+        print(f"- Required Categories:          {required_categories}")
+        print(f"- Found Categories:             {found_final}")
+        print(f"- Missing Categories:           {missing_final}")
+        print(f"- Total Retrieval Time:         {t_retrieval:.4f}s")
+        print(f"- Gemini Generation Time:       {t_gemini:.4f}s")
+        print(f"- Total Request Time:           {t_total:.4f}s")
         print("=" * 60 + "\n")
 
         output_dict = {
@@ -614,14 +1198,12 @@ Final Answer (MUST BE IN {target_lang}):
             "timings": timing_breakdown
         }
 
-        # Store in Safe Semantic Answer Cache if evidence was found
         if confidence_level != "Limited Evidence":
             self.answer_cache.put(cache_key, output_dict)
 
         return output_dict
 
     def get_metrics(self) -> Dict[str, Any]:
-        """Returns real production latency and cache performance metrics."""
         lats = sorted(self.latencies) if self.latencies else [0.0]
         n = len(lats)
         avg_lat = sum(lats) / n if n > 0 else 0.0
@@ -686,7 +1268,6 @@ CRITICAL RULES:
                 response = model.generate_content([vision_prompt, pil_image])
                 if response and response.text:
                     clean_text = response.text.strip()
-                    # Strip any markdown code fences if present
                     clean_text = re.sub(r'^```(json)?', '', clean_text, flags=re.IGNORECASE).strip()
                     clean_text = re.sub(r'```$', '', clean_text).strip()
                     vision_json = json.loads(clean_text)
@@ -699,9 +1280,7 @@ CRITICAL RULES:
                 time.sleep(1)
                 continue
 
-
         if not vision_json:
-            # Fallback product identification if Vision API JSON parsing fails
             vision_json = {
                 "product_name": "Unspecified Product",
                 "product_category": "General Goods",
@@ -716,15 +1295,12 @@ CRITICAL RULES:
             "confidence": vision_json.get("confidence", "Moderate")
         }
 
-        # Build RAG query using product identification + optional user question
         rag_query = f"{product_info['name']} {product_info['category']}"
         if user_question and user_question.strip():
             rag_query += f" {user_question.strip()}"
 
-        # Run RAG query against local BIS FAISS index
         rag_result = self.process_query(rag_query)
 
-        # Prefix answer to explicitly distinguish Vision Observation from BIS RAG Evidence
         observation_prefix = (
             f"**VISION OBSERVATION**:\n"
             f"Based on the image, the product appears to be **{product_info['name']}** ({product_info['category']}).\n\n"
@@ -738,7 +1314,6 @@ CRITICAL RULES:
             "evidence_status": rag_result["evidence_status"],
             "sources": rag_result["sources"]
         }
-
 
 # Global singleton instance
 rag_service = RAGService()
