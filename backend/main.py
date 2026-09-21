@@ -52,6 +52,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc: Exception):
+    """
+    Global exception handler ensuring all uncaught runtime errors return a valid JSON response with CORS headers.
+    """
+    import traceback
+    print(f"[ERROR] Global Exception Handler caught: {exc}")
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "status": "error",
+            "detail": f"An unexpected error occurred in PURIVU backend: {str(exc)}"
+        }
+    )
+
 # -----------------------------
 # Root Welcome Endpoint
 # -----------------------------
