@@ -1,14 +1,15 @@
 const getApiBaseUrl = () => {
-  if (import.meta.env.VITE_API_BASE_URL) {
-    return import.meta.env.VITE_API_BASE_URL;
-  }
-  if (typeof window !== 'undefined') {
+  let url = import.meta.env.VITE_API_BASE_URL;
+  if (!url && typeof window !== 'undefined') {
     const hostname = window.location.hostname;
     if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
-      return 'https://purivu-production.up.railway.app';
+      url = 'https://purivu-production.up.railway.app';
     }
   }
-  return 'http://127.0.0.1:8000';
+  if (!url) {
+    url = 'http://127.0.0.1:8000';
+  }
+  return url.replace(/\/+$/, '');
 };
 
 const API_BASE_URL = getApiBaseUrl();
