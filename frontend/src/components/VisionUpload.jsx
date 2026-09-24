@@ -57,12 +57,12 @@ export default function VisionUpload({ onAnalyze, loading }) {
   };
 
   return (
-    <div className="max-w-2xl mx-auto w-full bg-white rounded-2xl p-6 sm:p-8 border border-[#EEDFD7] shadow-sm text-center animate-fade-in space-y-6">
+    <div className="max-w-2xl mx-auto w-full bg-[#FFFDFC] rounded-[20px] p-6 sm:p-8 border border-[#E2B6A3] shadow-[0_4px_18px_rgba(90,24,85,0.06)] text-center animate-fade-in space-y-6">
       <div className="space-y-1.5">
-        <h2 className="text-xl sm:text-2xl font-semibold text-[#29242A]">
+        <h2 className="text-xl sm:text-2xl font-bold text-[#5A1855] font-heading">
           Show a Product
         </h2>
-        <p className="text-xs sm:text-sm text-[#756873]">
+        <p className="text-xs sm:text-sm text-[#735F6C]">
           Upload an image to identify the product and retrieve relevant BIS standards.
         </p>
       </div>
@@ -78,8 +78,8 @@ export default function VisionUpload({ onAnalyze, loading }) {
             onClick={() => fileInputRef.current?.click()}
             className={`border-2 border-dashed rounded-2xl p-8 cursor-pointer transition-all duration-200 flex flex-col items-center justify-center space-y-3 ${
               dragActive
-                ? 'border-[#D98268] bg-[#FBE3D5]'
-                : 'border-[#EEDFD7] hover:border-[#D98268]/60 bg-[#FBE3D5]/40 hover:bg-[#FBE3D5]/70'
+                ? 'border-[#D58A72] bg-[#FBE0D2]'
+                : 'border-[#E2B6A3] hover:border-[#D58A72] bg-[#FFF9F5] hover:bg-[#FBE0D2]/40'
             }`}
           >
             <input
@@ -89,22 +89,22 @@ export default function VisionUpload({ onAnalyze, loading }) {
               onChange={(e) => handleFileChange(e.target.files[0])}
               className="hidden"
             />
-            <div className="p-3.5 rounded-full bg-white border border-[#EEDFD7] text-[#4B1248] shadow-sm">
-              <UploadCloud className="w-7 h-7 text-[#4B1248]" />
+            <div className="p-3.5 rounded-full bg-[#FFFDFC] border border-[#E2B6A3] text-[#5A1855] shadow-xs">
+              <UploadCloud className="w-7 h-7 text-[#5A1855]" />
             </div>
             <div>
-              <p className="text-sm font-semibold text-[#29242A]">
-                Upload product image, or <span className="text-[#4B1248] underline">browse</span>
+              <p className="text-sm font-semibold text-[#321F2F]">
+                Upload product image, or <span className="text-[#5A1855] underline">browse</span>
               </p>
-              <p className="text-xs text-[#756873] mt-1">
+              <p className="text-xs text-[#735F6C] mt-1">
                 Supports JPEG, PNG, WEBP (Max 10 MB)
               </p>
             </div>
           </div>
         ) : (
           /* Image Preview Box */
-          <div className="relative rounded-2xl border border-[#EEDFD7] p-4 flex flex-col sm:flex-row items-center gap-4 bg-[#FFF9F5] text-left">
-            <div className="w-32 h-32 rounded-xl overflow-hidden bg-white border border-[#EEDFD7] shrink-0 relative flex items-center justify-center shadow-xs">
+          <div className="relative rounded-2xl border border-[#E2B6A3] p-4 flex flex-col sm:flex-row items-center gap-4 bg-[#FFF9F5] text-left">
+            <div className="w-32 h-32 rounded-xl overflow-hidden bg-[#FFFDFC] border border-[#E2B6A3] shrink-0 relative flex items-center justify-center shadow-xs">
               <img
                 src={previewUrl}
                 alt="Product preview"
@@ -113,11 +113,11 @@ export default function VisionUpload({ onAnalyze, loading }) {
             </div>
 
             <div className="flex-1 min-w-0 space-y-1">
-              <div className="flex items-center space-x-2 text-xs font-semibold text-[#29242A]">
-                <ImageIcon className="w-4 h-4 text-[#4B1248]" />
+              <div className="flex items-center space-x-2 text-xs font-semibold text-[#321F2F]">
+                <ImageIcon className="w-4 h-4 text-[#5A1855]" />
                 <span className="truncate">{selectedFile.name}</span>
               </div>
-              <p className="text-xs text-[#756873] font-mono">
+              <p className="text-xs text-[#735F6C] font-mono">
                 {(selectedFile.size / (1024 * 1024)).toFixed(2)} MB • Ready for analysis
               </p>
 
@@ -135,7 +135,7 @@ export default function VisionUpload({ onAnalyze, loading }) {
 
         {/* Optional Question Input */}
         <div className="text-left space-y-1.5">
-          <label className="text-xs font-medium text-[#756873]">
+          <label className="text-xs font-semibold text-[#735F6C] font-mono uppercase tracking-wider">
             Optional Question (e.g. "Is BIS certification required for this product?")
           </label>
           <input
@@ -144,7 +144,7 @@ export default function VisionUpload({ onAnalyze, loading }) {
             onChange={(e) => setUserQuestion(e.target.value)}
             placeholder="Ask something specific about this product..."
             disabled={loading}
-            className="w-full bg-[#FFF9F5] rounded-xl px-4 py-2.5 text-xs sm:text-sm text-[#29242A] placeholder-[#756873]/60 outline-none border border-[#EEDFD7] focus:border-[#4B1248] transition-colors"
+            className="w-full bg-[#FFFDFC] rounded-xl px-4 py-2.5 text-xs sm:text-sm text-[#321F2F] placeholder-[#917D87] outline-none border border-[#E2B6A3] focus:border-[#6A2365] focus:ring-3 focus:ring-[#6A2365]/10 transition-all"
           />
         </div>
 
@@ -152,15 +152,15 @@ export default function VisionUpload({ onAnalyze, loading }) {
         <button
           type="submit"
           disabled={!selectedFile || loading}
-          className={`w-full py-3 rounded-xl font-medium text-sm transition-all duration-200 flex items-center justify-center space-x-2 cursor-pointer ${
+          className={`w-full py-3 rounded-xl font-semibold text-sm transition-all duration-200 flex items-center justify-center space-x-2 cursor-pointer ${
             selectedFile && !loading
-              ? 'bg-[#4B1248] hover:bg-[#64175F] text-white shadow-xs'
-              : 'bg-[#EEDFD7]/50 text-[#756873] cursor-not-allowed border border-[#EEDFD7]'
+              ? 'bg-[#5A1855] hover:bg-[#6A2365] text-white shadow-xs'
+              : 'bg-[#FFF9F5] text-[#917D87] border border-[#E2B6A3] cursor-not-allowed'
           }`}
         >
           {loading ? (
             <>
-              <Loader2 className="w-5 h-5 animate-spin text-[#2864E8]" />
+              <Loader2 className="w-5 h-5 animate-spin text-white" />
               <span>Analyzing product & checking BIS evidence...</span>
             </>
           ) : (
