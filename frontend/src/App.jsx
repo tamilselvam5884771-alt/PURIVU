@@ -142,7 +142,7 @@ export default function App() {
   ];
 
   return (
-    <div className="min-h-screen flex flex-col justify-between text-[#29242A] bg-[#FFF9F5] selection:bg-[#F3C7B5] selection:text-[#4B1248]">
+    <div className="min-h-screen flex flex-col justify-between text-[#321F2F] bg-[#FFF5EE] selection:bg-[#FBE0D2] selection:text-[#5A1855]">
       {/* Header */}
       <Navbar healthStatus={healthStatus} />
 
@@ -165,14 +165,14 @@ export default function App() {
             {/* Hero Section */}
             <div className="relative flex flex-col items-center justify-center my-2">
               {/* Subtle light theme knowledge pulse */}
-              <div className="absolute w-44 h-44 rounded-full border border-[#4B1248]/10 animate-ring-1 pointer-events-none" />
-              <div className="absolute w-60 h-60 rounded-full border border-[#D98268]/10 animate-ring-2 pointer-events-none" />
-              <div className="absolute w-36 h-36 rounded-full bg-[#F3C7B5]/20 blur-2xl animate-knowledge-pulse pointer-events-none" />
+              <div className="absolute w-44 h-44 rounded-full border border-[#5A1855]/10 animate-ring-1 pointer-events-none" />
+              <div className="absolute w-60 h-60 rounded-full border border-[#E58F75]/10 animate-ring-2 pointer-events-none" />
+              <div className="absolute w-36 h-36 rounded-full bg-[#FBE0D2]/30 blur-2xl animate-knowledge-pulse pointer-events-none" />
 
-              <h1 className="text-3xl sm:text-4xl font-semibold text-[#29242A] tracking-tight mb-1">
+              <h1 className="text-3xl sm:text-4xl font-bold text-[#5A1855] tracking-tight mb-1 font-heading">
                 PURIVU
               </h1>
-              <p className="text-sm sm:text-base text-[#756873] font-normal max-w-md mx-auto">
+              <p className="text-sm sm:text-base text-[#735F6C] font-normal max-w-md mx-auto">
                 Understand standards. Make compliance simpler.
               </p>
             </div>
@@ -185,7 +185,7 @@ export default function App() {
 
             {/* ERROR DISPLAY */}
             {error && (
-              <div className="max-w-xl mx-auto p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs sm:text-sm">
+              <div className="max-w-xl mx-auto p-3.5 rounded-xl bg-[#FBE5E0] border border-[#E5B3A8] text-[#9A4B3F] text-xs sm:text-sm font-medium">
                 ⚠️ {error}
               </div>
             )}
@@ -194,15 +194,15 @@ export default function App() {
             {activeTab === 'ask' && (
               <div className="space-y-6">
                 <form onSubmit={handleTextSubmit} className="max-w-2xl mx-auto w-full">
-                  <div className="bg-white rounded-2xl p-2 sm:p-2.5 flex items-center space-x-3 border border-[#EEDFD7] shadow-sm transition-all duration-200 focus-within:border-[#4B1248]">
-                    <Search className="w-5 h-5 text-[#756873] shrink-0 ml-2.5" />
+                  <div className="bg-[#FFFDFC] rounded-2xl p-2 sm:p-2.5 flex items-center space-x-3 border border-[#E2B6A3] shadow-[0_4px_18px_rgba(90,24,85,0.04)] transition-all duration-200 focus-within:border-[#6A2365] focus-within:ring-3 focus-within:ring-[#6A2365]/10">
+                    <Search className="w-5 h-5 text-[#735F6C] shrink-0 ml-2.5" />
                     <input
                       type="text"
                       value={question}
                       onChange={(e) => setQuestion(e.target.value)}
                       placeholder="Ask about a BIS standard, certification or hallmarking..."
                       disabled={loading}
-                      className="w-full bg-transparent border-0 outline-none text-[#29242A] placeholder-[#756873]/60 text-sm py-1.5"
+                      className="w-full bg-transparent border-0 outline-none text-[#321F2F] placeholder-[#917D87] text-sm py-1.5"
                     />
 
                     <div className="flex items-center space-x-1.5 shrink-0">
@@ -210,25 +210,25 @@ export default function App() {
                         type="button"
                         onClick={() => handleTabSelect('vaani')}
                         title="VAANI Voice Assistant"
-                        className="p-2 rounded-xl text-[#756873] hover:text-[#4B1248] hover:bg-[#FFF9F5] transition-colors cursor-pointer"
+                        className="p-2 rounded-xl text-[#735F6C] hover:text-[#5A1855] hover:bg-[#FFF9F5] transition-colors cursor-pointer"
                       >
-                        <Mic className="w-4 h-4" />
+                        <Mic className="w-4 h-4 text-[#E58F75]" />
                       </button>
                       <button
                         type="button"
                         onClick={() => handleTabSelect('show')}
                         title="SHOW Vision Analysis"
-                        className="p-2 rounded-xl text-[#756873] hover:text-[#4B1248] hover:bg-[#FFF9F5] transition-colors cursor-pointer"
+                        className="p-2 rounded-xl text-[#735F6C] hover:text-[#5A1855] hover:bg-[#FFF9F5] transition-colors cursor-pointer"
                       >
-                        <Camera className="w-4 h-4" />
+                        <Camera className="w-4 h-4 text-[#E58F75]" />
                       </button>
                       <button
                         type="submit"
                         disabled={loading || !question.trim()}
-                        className={`px-4 py-2 rounded-xl font-medium text-xs sm:text-sm transition-all cursor-pointer ${
+                        className={`px-4 py-2 rounded-xl font-semibold text-xs sm:text-sm transition-all cursor-pointer ${
                           question.trim() && !loading
-                            ? 'bg-[#4B1248] hover:bg-[#64175F] text-white shadow-xs'
-                            : 'bg-[#EEDFD7]/60 text-[#756873] cursor-not-allowed'
+                            ? 'bg-[#5A1855] hover:bg-[#6A2365] text-white shadow-xs'
+                            : 'bg-[#FFF9F5] text-[#917D87] border border-[#E2B6A3] cursor-not-allowed'
                         }`}
                       >
                         {loading ? (
@@ -244,8 +244,8 @@ export default function App() {
                 {/* Loading Sequence Indicator */}
                 {loading && (
                   <div className="flex flex-col items-center justify-center space-y-3 py-4 animate-pulse">
-                    <div className="w-8 h-8 rounded-full border-2 border-[#4B1248] border-t-transparent animate-spin text-[#2864E8]" />
-                    <p className="text-xs text-[#756873] font-mono">
+                    <div className="w-8 h-8 rounded-full border-2 border-[#5A1855] border-t-transparent animate-spin text-[#3478E5]" />
+                    <p className="text-xs text-[#735F6C] font-mono">
                       Checking BIS evidence & synthesizing answer...
                     </p>
                   </div>
@@ -259,7 +259,7 @@ export default function App() {
                         <button
                           key={idx}
                           onClick={() => handleSuggestionClick(text)}
-                          className="bg-white hover:bg-[#FBE3D5]/50 px-3.5 py-1.5 rounded-full text-xs text-[#756873] hover:text-[#4B1248] transition-colors border border-[#EEDFD7] shadow-2xs cursor-pointer"
+                          className="bg-[#FFFDFC] hover:bg-[#FBE0D2]/50 px-3.5 py-1.5 rounded-full text-xs text-[#735F6C] hover:text-[#5A1855] transition-colors border border-[#E2B6A3] shadow-2xs cursor-pointer font-medium"
                         >
                           "{text}"
                         </button>
@@ -277,8 +277,8 @@ export default function App() {
 
                 {loading && (
                   <div className="flex flex-col items-center justify-center space-y-3 py-4 animate-pulse">
-                    <div className="w-8 h-8 rounded-full border-2 border-[#4B1248] border-t-transparent animate-spin" />
-                    <p className="text-xs text-[#756873] font-mono">
+                    <div className="w-8 h-8 rounded-full border-2 border-[#5A1855] border-t-transparent animate-spin text-[#3478E5]" />
+                    <p className="text-xs text-[#735F6C] font-mono">
                       {loadingStep || 'Analyzing product image & checking BIS evidence...'}
                     </p>
                   </div>
@@ -321,7 +321,7 @@ export default function App() {
       </main>
 
       {/* Footer */}
-      <footer className="w-full py-4 text-center text-xs text-[#756873] border-t border-[#EEDFD7] mt-8 bg-white/50">
+      <footer className="w-full py-4 text-center text-xs text-[#735F6C] border-t border-[#E8C5B5] mt-8 bg-[#FFFDFC]/80 backdrop-blur-xs font-mono">
         PURIVU — BIS Intelligence
       </footer>
     </div>
