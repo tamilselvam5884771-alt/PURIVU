@@ -124,6 +124,8 @@ async def get_health():
         gemini=rag_service.get_gemini_status(),
         text_model=rag_service.get_text_model(),
         vision_model=rag_service.get_vision_model(),
+        corpus_chunk_positions=rag_service.get_corpus_chunk_positions(),
+        unique_indexed_chunks=rag_service.get_chunk_count(),
         total_chunks=rag_service.get_chunk_count()
     )
 

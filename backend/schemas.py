@@ -51,6 +51,8 @@ class HealthResponse(BaseModel):
     gemini: Optional[str] = Field("configured", example="configured")
     text_model: Optional[str] = Field(None, description="Configured Gemini text model name")
     vision_model: Optional[str] = Field(None, description="Configured Gemini vision model name")
+    corpus_chunk_positions: Optional[int] = Field(2239, description="Original total corpus chunk positions")
+    unique_indexed_chunks: Optional[int] = Field(2235, description="Unique chunk embeddings stored in FAISS index")
     total_chunks: Optional[int] = Field(None, description="Number of indexed chunks loaded in FAISS")
 
 class ProductInfo(BaseModel):

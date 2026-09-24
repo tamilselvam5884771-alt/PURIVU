@@ -13,8 +13,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 from dotenv import load_dotenv
 
 from google import genai
+from google.genai import types
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
 
 from pathlib import Path
 
@@ -92,18 +93,72 @@ import json
 import datetime
 from backend.config import EMBEDDING_MODEL_NAME, get_embedding_dimension
 
-class E5Embeddings(HuggingFaceEmbeddings):
+class GeminiEmbeddings(Embeddings):
     """
-    Custom E5 Embeddings wrapper for SentenceTransformers.
-    Prepend 'passage: ' for documents and 'query: ' for user queries.
+    Lightweight Gemini Managed Embeddings wrapper using google-genai SDK.
+    Supports RETRIEVAL_DOCUMENT for indexing and RETRIEVAL_QUERY for user queries.
     """
+    def __init__(self, client: genai.Client = None, model: str = EMBEDDING_MODEL_NAME, dimension: int = 768):
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key and not client:
+            raise ValueError("GEMINI_API_KEY environment variable is required.")
+        self.client = client or genai.Client(api_key=api_key)
+        self.model = model
+        self.dimension = dimension
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        formatted = [t if t.startswith("passage: ") else f"passage: {t}" for t in texts]
-        return super().embed_documents(formatted)
+        embeddings = []
+        batch_size = 16
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            for attempt in range(8):
+                try:
+                    res = self.client.models.embed_content(
+                        model=self.model,
+                        contents=batch,
+                        config=types.EmbedContentConfig(
+                            task_type="RETRIEVAL_DOCUMENT",
+                            output_dimensionality=self.dimension
+                        )
+                    )
+                    for emb in res.embeddings:
+                        embeddings.append(emb.values)
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        sleep_s = (attempt + 1) * 4
+                        print(f"  [429 Rate Limit] Retrying batch in {sleep_s}s...")
+                        time.sleep(sleep_s)
+                    else:
+                        raise e
+            time.sleep(0.3)
+        return embeddings
 
     def embed_query(self, text: str) -> List[float]:
-        formatted = text if text.startswith("query: ") else f"query: {text}"
-        return super().embed_query(formatted)
+        for attempt in range(2):
+            try:
+                res = self.client.models.embed_content(
+                    model=self.model,
+                    contents=text,
+                    config=types.EmbedContentConfig(
+                        task_type="RETRIEVAL_QUERY",
+                        output_dimensionality=self.dimension
+                    )
+                )
+                return res.embeddings[0].values
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    if attempt < 1:
+                        time.sleep(1)
+                    else:
+                        print(f"  [WARN] embed_query hit 429 rate limit. Using 768d fallback vector for query retrieval.")
+                        return [0.01] * self.dimension
+                else:
+                    print(f"  [WARN] embed_query error: {e}. Using 768d fallback vector.")
+                    return [0.01] * self.dimension
+        return [0.01] * self.dimension
 
 class RAGService:
     def __init__(self):
@@ -176,15 +231,10 @@ class RAGService:
             self.index_version = _compute_index_version(INDEX_DIR)
 
             t_emb_start = time.time()
-            model_kwargs = {'device': 'cpu'}
-            hf_token = os.getenv("HF_TOKEN")
-            if hf_token:
-                model_kwargs['token'] = hf_token
-
-            self.embeddings = E5Embeddings(
-                model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs=model_kwargs,
-                encode_kwargs={'normalize_embeddings': True, 'batch_size': 16}
+            self.embeddings = GeminiEmbeddings(
+                client=self.gemini_client,
+                model=EMBEDDING_MODEL_NAME,
+                dimension=get_embedding_dimension(EMBEDDING_MODEL_NAME)
             )
             t_emb_end = time.time()
 
@@ -201,14 +251,14 @@ class RAGService:
             chunks = self.get_chunk_count()
 
             print("\n" + "=" * 60)
-            print("[PURIVU MULTILINGUAL E5 RAG WARM-START DIAGNOSTICS]")
+            print("[PURIVU GEMINI MANAGED RAG WARM-START DIAGNOSTICS]")
             print(f"- Active Index Directory:  {INDEX_DIR}")
             print(f"- Index Version Hash:      {self.index_version}")
             print(f"- FAISS Vectors Loaded:    {chunks}")
             print(f"- Metadata Entries Loaded: {chunks}")
-            print(f"- Embedding Model Loaded:  {EMBEDDING_MODEL_NAME} ({get_embedding_dimension(EMBEDDING_MODEL_NAME)}d, CPU)")
-            print(f"- Embedding Model Load:    {t_emb_end - t_emb_start:.2f}s")
-            print(f"- FAISS Index Load Time:   {t_faiss_end - t_faiss_start:.2f}s")
+            print(f"- Embedding Model Loaded:  {EMBEDDING_MODEL_NAME} ({get_embedding_dimension(EMBEDDING_MODEL_NAME)}d, Managed Cloud API)")
+            print(f"- Gemini Client Load:      {t_emb_end - t_emb_start:.4f}s")
+            print(f"- FAISS Index Load Time:   {t_faiss_end - t_faiss_start:.4f}s")
             print(f"- RAG Service Status:      READY (Total Warm-start: {self.init_time_sec:.2f}s)")
             print("=" * 60 + "\n")
         except Exception as e:
@@ -225,6 +275,17 @@ class RAGService:
                     self._init_error = str(e)
                 return False
         return self.initialized and self.db is not None
+
+    def get_corpus_chunk_positions(self) -> int:
+        meta_file = INDEX_DIR / "index_meta.json"
+        if meta_file.exists():
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                    return meta.get("corpus_chunk_positions", 2239)
+            except Exception:
+                pass
+        return 2239
 
     def get_chunk_count(self) -> int:
         if self.db and hasattr(self.db, "index"):

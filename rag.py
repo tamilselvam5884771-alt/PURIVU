@@ -13,11 +13,16 @@ from pathlib import Path
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import pypdf
+from google import genai
+from google.genai import types
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from backend.config import EMBEDDING_MODEL_NAME, get_embedding_dimension
 
@@ -26,18 +31,101 @@ BIS_DATA_DIR = BASE_DIR / "data" / "bis"
 OUTPUT_INDEX_DIR = BASE_DIR / "faiss_index_bis"
 TEMP_INDEX_DIR = BASE_DIR / "faiss_index_bis_temp"
 
-class E5Embeddings(HuggingFaceEmbeddings):
+CACHE_FILE = BASE_DIR / "scratch" / "chunk_embeddings_cache_gemini2_768.json"
+
+class GeminiEmbeddings(Embeddings):
     """
-    Custom E5 Embeddings wrapper for SentenceTransformers.
-    Prepend 'passage: ' for documents and 'query: ' for user queries.
+    Lightweight Gemini Managed Embeddings wrapper using google-genai SDK.
+    Prepares document embeddings using RETRIEVAL_DOCUMENT and query embeddings using RETRIEVAL_QUERY.
     """
+    def __init__(self, client: genai.Client = None, model: str = EMBEDDING_MODEL_NAME, dimension: int = 768):
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key and not client:
+            raise ValueError("GEMINI_API_KEY environment variable is required.")
+        self.client = client or genai.Client(api_key=api_key)
+        self.model = model
+        self.dimension = dimension
+        self._cache = {}
+        if CACHE_FILE.exists():
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    self._cache = json.load(f)
+                print(f"  [CACHE] Preloaded {len(self._cache)} vectors from '{CACHE_FILE.name}'", flush=True)
+            except Exception:
+                pass
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        formatted = [t if t.startswith("passage: ") else f"passage: {t}" for t in texts]
-        return super().embed_documents(formatted)
+        embeddings = [None] * len(texts)
+        missing_indices = []
+
+        for idx, text in enumerate(texts):
+            c_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+            if c_hash in self._cache and len(self._cache[c_hash]) == self.dimension:
+                embeddings[idx] = self._cache[c_hash]
+            else:
+                missing_indices.append((idx, c_hash, text))
+
+        if missing_indices:
+            print(f"  [EMBED] Generating embeddings for {len(missing_indices)} missing chunks via Gemini API...", flush=True)
+            for count, (orig_idx, c_hash, text) in enumerate(missing_indices, start=1):
+                for attempt in range(8):
+                    try:
+                        res = self.client.models.embed_content(
+                            model=self.model,
+                            contents=text,
+                            config=types.EmbedContentConfig(
+                                task_type="RETRIEVAL_DOCUMENT",
+                                output_dimensionality=self.dimension
+                            )
+                        )
+                        vec = res.embeddings[0].values
+                        embeddings[orig_idx] = vec
+                        self._cache[c_hash] = vec
+                        break
+                    except Exception as e:
+                        err_str = str(e)
+                        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                            sleep_s = 60
+                            print(f"  [429 Rate Limit] Sleeping 60s (item {count}/{len(missing_indices)})...", flush=True)
+                            time.sleep(sleep_s)
+                        else:
+                            raise e
+
+                # Save cache after every chunk
+                try:
+                    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(self._cache, f)
+                except Exception:
+                    pass
+
+                if count % 20 == 0 or count == len(missing_indices):
+                    done_count = len(self._cache)
+                    print(f"  [PROGRESS] Cached {done_count}/{len(texts)} chunks ({done_count/len(texts)*100:.1f}%)", flush=True)
+                
+                time.sleep(4.1)  # Respect 15 RPM limit
+
+        return embeddings
 
     def embed_query(self, text: str) -> List[float]:
-        formatted = text if text.startswith("query: ") else f"query: {text}"
-        return super().embed_query(formatted)
+        for attempt in range(8):
+            try:
+                res = self.client.models.embed_content(
+                    model=self.model,
+                    contents=text,
+                    config=types.EmbedContentConfig(
+                        task_type="RETRIEVAL_QUERY",
+                        output_dimensionality=self.dimension
+                    )
+                )
+                return res.embeddings[0].values
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    sleep_s = (attempt + 1) * 3
+                    time.sleep(sleep_s)
+                else:
+                    raise e
+        raise RuntimeError("Gemini embed_query failed after maximum retries.")
 
 def determine_category(filepath: Path, filename: str, text: str) -> str:
     """
@@ -241,17 +329,8 @@ def run_ingestion_pipeline(dry_run: bool = False):
         return
 
     # Build Index in Temporary Staging Directory
-    print(f"\n🧠 Generating Multilingual Embeddings ({EMBEDDING_MODEL_NAME})...")
-    model_kwargs = {'device': 'cpu'}
-    hf_token = os.getenv("HF_TOKEN")
-    if hf_token:
-        model_kwargs['token'] = hf_token
-
-    embeddings = E5Embeddings(
-        model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs=model_kwargs,
-        encode_kwargs={'normalize_embeddings': True, 'batch_size': 16}
-    )
+    print(f"\n🧠 Generating Gemini Managed Embeddings ({EMBEDDING_MODEL_NAME}, dim={expected_dim})...")
+    embeddings = GeminiEmbeddings(model=EMBEDDING_MODEL_NAME, dimension=expected_dim)
 
     print("💾 Creating Temporary FAISS Vector Database...")
     if TEMP_INDEX_DIR.exists():
@@ -262,6 +341,7 @@ def run_ingestion_pipeline(dry_run: bool = False):
     db.save_local(TEMP_INDEX_DIR)
 
     meta_info = {
+        "embedding_provider": "google-genai",
         "embedding_model": EMBEDDING_MODEL_NAME,
         "embedding_model_name": EMBEDDING_MODEL_NAME,
         "embedding_dimension": expected_dim,
@@ -270,6 +350,7 @@ def run_ingestion_pipeline(dry_run: bool = False):
         "total_chunks": total_chunks,
         "document_count": stats['pdf_processed'],
         "index_type": "FAISS_IndexFlatIP",
+        "index_metric": "Cosine_Similarity",
         "metric": "InnerProduct_Cosine",
         "generated_at": datetime.datetime.now().isoformat(),
         "built_at": datetime.datetime.now().isoformat(),
@@ -287,7 +368,7 @@ def run_ingestion_pipeline(dry_run: bool = False):
     faiss_file = TEMP_INDEX_DIR / "index.faiss"
     pkl_file = TEMP_INDEX_DIR / "index.pkl"
 
-    val_dim_pass = (expected_dim == 384)
+    val_dim_pass = (db.index.d == expected_dim)
     val_vec_pass = (db.index.ntotal == total_chunks)
     val_files_pass = faiss_file.exists() and pkl_file.exists() and meta_file.exists() and faiss_file.stat().st_size > 0
     val_empty_pass = not any(len(c.page_content.strip()) == 0 for c in chunked_docs)
@@ -327,7 +408,7 @@ def run_ingestion_pipeline(dry_run: bool = False):
     for cat, cnt in sorted(cat_counts.items()):
         print(f"  {cat}: {cnt}")
     print("\nValidation:")
-    print("  [PASS] dimension (384d)")
+    print(f"  [PASS] dimension ({expected_dim}d)")
     print(f"  [PASS] vector count ({total_chunks})")
     print("  [PASS] metadata (index_meta.json)")
     print(f"  [PASS] duplicate detection ({stats['duplicates_skipped']} skipped)")

@@ -48,9 +48,7 @@ INDEX_DIR = "faiss_index_bis" if os.path.exists("faiss_index_bis") else "faiss_i
 # -----------------------------
 @st.cache_resource
 def load_database():
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
+    embeddings = GeminiEmbeddings()
     db = FAISS.load_local(
         INDEX_DIR,
         embeddings,
