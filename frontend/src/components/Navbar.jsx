@@ -11,7 +11,7 @@ export default function Navbar({ healthStatus }) {
           <img
             src="/purivu-logo.png"
             alt="PURIVU Logo"
-            className="h-9 w-auto rounded-lg shadow-xs"
+            className="h-10 w-10 rounded-full object-cover shadow-xs"
           />
           <div className="flex items-center space-x-2">
             <span className="font-heading font-extrabold text-xl text-[#5A1855] tracking-tight">
